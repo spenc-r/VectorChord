@@ -19,8 +19,8 @@ import psycopg
 QUERY = """
 SELECT id
 FROM metadata_prefilter_smoke
-WHERE feed_id_meta_hash = hashtextextended('feed-17', 0)
-  AND status_meta = 1
+WHERE feed_id_meta_hash = hashtextextended('feed-10', 0)
+  AND status_meta = 0
   AND deleted_meta = 0
 ORDER BY v <-> '[0.13,0.21,0.34]'::vector
 LIMIT 50
@@ -29,12 +29,12 @@ LIMIT 50
 
 def run_timed(cur: psycopg.Cursor, mode: str, debug: bool, repeats: int) -> tuple[list[int], float]:
     cur.execute("SET vchordrq.prefilter = on")
-    cur.execute("SET vchordrq.metadata_prefilter = %s", (mode,))
+    cur.execute(f"SET vchordrq.metadata_prefilter = {mode}")
     cur.execute(
         "SET vchordrq.metadata_active_columns = "
         "'feed,flags,status,deleted,visibility,geo,time'"
     )
-    cur.execute("SET vchordrq.metadata_prefilter_debug = %s", ("on" if debug else "off",))
+    cur.execute(f"SET vchordrq.metadata_prefilter_debug = {'on' if debug else 'off'}")
 
     timings = []
     result: list[int] = []
@@ -78,17 +78,17 @@ def main() -> None:
                 """
                 INSERT INTO metadata_prefilter_smoke
                 SELECT i,
-                       hashtextextended('feed-' || (i % 100)::text, 0),
-                       (i % 5)::bigint,
-                       (i % 2)::bigint,
-                       ((i % 97) = 0)::int::bigint,
-                       CASE WHEN i % 8 = 0 THEN 7 ELSE 3 END,
-                       (i % 512)::bigint,
+                       hashtextextended('feed-' || (i %% 100)::text, 0),
+                       (i %% 5)::bigint,
+                       (i %% 2)::bigint,
+                       ((i %% 97) = 0)::int::bigint,
+                       CASE WHEN i %% 8 = 0 THEN 7 ELSE 3 END,
+                       (i %% 512)::bigint,
                        (i / 256)::bigint,
                        ARRAY[
-                         (i % 997) / 997.0,
-                         (i % 991) / 991.0,
-                         (i % 983) / 983.0
+                         (i %% 997) / 997.0,
+                         (i %% 991) / 991.0,
+                         (i %% 983) / 983.0
                        ]::real[]::vector
                 FROM generate_series(1, %s) i
                 """,
@@ -130,8 +130,8 @@ def main() -> None:
                 SELECT count(*)
                 FROM metadata_prefilter_smoke
                 WHERE NOT (
-                  feed_id_meta_hash = hashtextextended('feed-17', 0)
-                  AND status_meta = 1
+                  feed_id_meta_hash = hashtextextended('feed-10', 0)
+                  AND status_meta = 0
                   AND deleted_meta = 0
                 )
                 """

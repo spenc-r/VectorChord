@@ -83,7 +83,7 @@ pub enum RerankMethod {
 
 pub const MAX_METADATA_ATTRS: usize = 32;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CandidateMetadata {
     valid: u32,
     values: [i64; MAX_METADATA_ATTRS],

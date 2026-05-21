@@ -86,9 +86,9 @@ pub fn default_search_with_candidate_filter<'b, R: RelationRead, O: Operator>(
     probes: Vec<u32>,
     epsilon: f32,
     bump: &'b impl Bump,
-    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
-    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
-    mut candidate_filter: impl FnMut(NonZero<u64>, CandidateMetadata) -> bool,
+    prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
+    prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
+    candidate_filter: impl FnMut(NonZero<u64>, CandidateMetadata) -> bool,
 ) -> (
     Vec<(
         (Reverse<Distance>, AlwaysEqual<()>),
@@ -107,7 +107,7 @@ where
         bump,
         prefetch_h1_vectors,
         prefetch_h0_tuples,
-        |payload, metadata| candidate_filter(payload, metadata),
+        candidate_filter,
         |_, _| BlockPrune::Disabled,
     )
 }

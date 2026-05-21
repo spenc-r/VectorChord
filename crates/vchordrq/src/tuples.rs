@@ -1131,7 +1131,7 @@ struct MetadataTailHeader {
     _padding_0: u16,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct MetadataTailReader<'a> {
     source: &'a [u8],
     attr_count: usize,
