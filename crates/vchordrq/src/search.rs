@@ -12,12 +12,12 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use crate::closure_lifetime_binder::{id_0, id_1, id_2};
+use crate::closure_lifetime_binder::{id_0, id_1, id_5};
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
 use crate::tape::{by_directory, by_next};
 use crate::tuples::*;
-use crate::{Opaque, centroids, tape};
+use crate::{CandidateMetadata, Opaque, centroids, tape};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use index::accessor::{DefaultWithDimension, FunctionalAccessor, LAccess};
@@ -26,6 +26,7 @@ use index::fetch::BorrowedIter;
 use index::packed::{PackedRefMut4, PackedRefMut8};
 use index::prefetcher::{Prefetcher, PrefetcherHeapFamily, PrefetcherSequenceFamily};
 use index::relation::{Page, RelationRead};
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::num::NonZero;
@@ -33,7 +34,53 @@ use vector::{VectorBorrowed, VectorOwned};
 
 type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultSearchStats {
+    pub candidate_count: usize,
+    pub candidate_count_before_block_prune: usize,
+    pub candidate_count_after_block_prune: usize,
+    pub block_summary_checked_count: usize,
+    pub block_summary_rejected_count: usize,
+    pub block_summary_maybe_count: usize,
+    pub block_summary_candidates_skipped_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockPrune {
+    Disabled,
+    Scan,
+    Skip,
+}
+
 pub fn default_search<'b, R: RelationRead, O: Operator>(
+    index: &'b R,
+    vector: <O::Vector as VectorOwned>::Borrowed<'_>,
+    probes: Vec<u32>,
+    epsilon: f32,
+    bump: &'b impl Bump,
+    prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
+    prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
+) -> Vec<(
+    (Reverse<Distance>, AlwaysEqual<()>),
+    AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, CandidateMetadata, BorrowedIter<'b>)>>,
+)>
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let (results, _) = default_search_with_candidate_filter::<R, O>(
+        index,
+        vector,
+        probes,
+        epsilon,
+        bump,
+        prefetch_h1_vectors,
+        prefetch_h0_tuples,
+        |_, _| true,
+    );
+    results
+}
+
+pub fn default_search_with_candidate_filter<'b, R: RelationRead, O: Operator>(
     index: &'b R,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     probes: Vec<u32>,
@@ -41,10 +88,47 @@ pub fn default_search<'b, R: RelationRead, O: Operator>(
     bump: &'b impl Bump,
     mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
     mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
-) -> Vec<(
-    (Reverse<Distance>, AlwaysEqual<()>),
-    AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, BorrowedIter<'b>)>>,
-)>
+    mut candidate_filter: impl FnMut(NonZero<u64>, CandidateMetadata) -> bool,
+) -> (
+    Vec<(
+        (Reverse<Distance>, AlwaysEqual<()>),
+        AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, CandidateMetadata, BorrowedIter<'b>)>>,
+    )>,
+    DefaultSearchStats,
+)
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    default_search_with_candidate_filter_and_block_prune::<R, O>(
+        index,
+        vector,
+        probes,
+        epsilon,
+        bump,
+        prefetch_h1_vectors,
+        prefetch_h0_tuples,
+        |payload, metadata| candidate_filter(payload, metadata),
+        |_, _| BlockPrune::Disabled,
+    )
+}
+
+pub fn default_search_with_candidate_filter_and_block_prune<'b, R: RelationRead, O: Operator>(
+    index: &'b R,
+    vector: <O::Vector as VectorOwned>::Borrowed<'_>,
+    probes: Vec<u32>,
+    epsilon: f32,
+    bump: &'b impl Bump,
+    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
+    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
+    mut candidate_filter: impl FnMut(NonZero<u64>, CandidateMetadata) -> bool,
+    mut block_prune: impl FnMut(&[CandidateMetadata; 32], &[Option<NonZero<u64>>; 32]) -> BlockPrune,
+) -> (
+    Vec<(
+        (Reverse<Distance>, AlwaysEqual<()>),
+        AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, CandidateMetadata, BorrowedIter<'b>)>>,
+    )>,
+    DefaultSearchStats,
+)
 where
     R::Page: Page<Opaque = Opaque>,
 {
@@ -157,33 +241,94 @@ where
     }
 
     let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();
+    let candidate_count = Cell::new(0_usize);
+    let candidate_count_before_block_prune = Cell::new(0_usize);
+    let candidate_count_after_block_prune = Cell::new(0_usize);
+    let block_summary_checked_count = Cell::new(0_usize);
+    let block_summary_rejected_count = Cell::new(0_usize);
+    let block_summary_maybe_count = Cell::new(0_usize);
+    let block_summary_candidates_skipped_count = Cell::new(0_usize);
     for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in state {
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-        let mut callback = id_2(|(rough, err), head, payload, prefetch| {
-            let lowerbound = Distance::from_f32(rough - err * epsilon);
-            results.push((
-                (Reverse(lowerbound), AlwaysEqual(())),
-                AlwaysEqual(PackedRefMut4(bump.alloc((
-                    payload,
-                    head,
-                    BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
-                )))),
-            ));
-        });
+        let mut callback = id_5(
+            |(rough, err), head, payload, candidate_metadata, prefetch| {
+                candidate_count.set(candidate_count.get() + 1);
+                candidate_count_before_block_prune
+                    .set(candidate_count_before_block_prune.get() + 1);
+                candidate_count_after_block_prune.set(candidate_count_after_block_prune.get() + 1);
+                if !candidate_filter(payload, candidate_metadata) {
+                    return;
+                }
+                let lowerbound = Distance::from_f32(rough - err * epsilon);
+                results.push((
+                    (Reverse(lowerbound), AlwaysEqual(())),
+                    AlwaysEqual(PackedRefMut4(bump.alloc((
+                        payload,
+                        head,
+                        candidate_metadata,
+                        BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
+                    )))),
+                ));
+            },
+        );
         if prefetch_h0_tuples.is_not_plain() {
             let directory =
                 tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
-            tape::read_frozen_tape::<R, _, _>(
+            tape::read_frozen_tape_with_block_prune::<R, _, _>(
                 by_directory(&mut prefetch_h0_tuples, directory),
                 || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
+                |candidate_metadata, payload| {
+                    let candidate_len = payload.iter().filter(|payload| payload.is_some()).count();
+                    match block_prune(candidate_metadata, payload) {
+                        BlockPrune::Disabled => BlockPrune::Scan,
+                        BlockPrune::Scan => {
+                            block_summary_checked_count.set(block_summary_checked_count.get() + 1);
+                            block_summary_maybe_count.set(block_summary_maybe_count.get() + 1);
+                            BlockPrune::Scan
+                        }
+                        BlockPrune::Skip => {
+                            block_summary_checked_count.set(block_summary_checked_count.get() + 1);
+                            block_summary_rejected_count
+                                .set(block_summary_rejected_count.get() + 1);
+                            block_summary_candidates_skipped_count
+                                .set(block_summary_candidates_skipped_count.get() + candidate_len);
+                            candidate_count.set(candidate_count.get() + candidate_len);
+                            candidate_count_before_block_prune
+                                .set(candidate_count_before_block_prune.get() + candidate_len);
+                            BlockPrune::Skip
+                        }
+                    }
+                },
                 &mut callback,
             );
         } else {
-            tape::read_frozen_tape::<R, _, _>(
+            tape::read_frozen_tape_with_block_prune::<R, _, _>(
                 by_next(index, jump_tuple.frozen_first()),
                 || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
+                |candidate_metadata, payload| {
+                    let candidate_len = payload.iter().filter(|payload| payload.is_some()).count();
+                    match block_prune(candidate_metadata, payload) {
+                        BlockPrune::Disabled => BlockPrune::Scan,
+                        BlockPrune::Scan => {
+                            block_summary_checked_count.set(block_summary_checked_count.get() + 1);
+                            block_summary_maybe_count.set(block_summary_maybe_count.get() + 1);
+                            BlockPrune::Scan
+                        }
+                        BlockPrune::Skip => {
+                            block_summary_checked_count.set(block_summary_checked_count.get() + 1);
+                            block_summary_rejected_count
+                                .set(block_summary_rejected_count.get() + 1);
+                            block_summary_candidates_skipped_count
+                                .set(block_summary_candidates_skipped_count.get() + candidate_len);
+                            candidate_count.set(candidate_count.get() + candidate_len);
+                            candidate_count_before_block_prune
+                                .set(candidate_count_before_block_prune.get() + candidate_len);
+                            BlockPrune::Skip
+                        }
+                    }
+                },
                 &mut callback,
             );
         }
@@ -193,7 +338,18 @@ where
             &mut callback,
         );
     }
-    results.into_vec()
+    (
+        results.into_vec(),
+        DefaultSearchStats {
+            candidate_count: candidate_count.get(),
+            candidate_count_before_block_prune: candidate_count_before_block_prune.get(),
+            candidate_count_after_block_prune: candidate_count_after_block_prune.get(),
+            block_summary_checked_count: block_summary_checked_count.get(),
+            block_summary_rejected_count: block_summary_rejected_count.get(),
+            block_summary_maybe_count: block_summary_maybe_count.get(),
+            block_summary_candidates_skipped_count: block_summary_candidates_skipped_count.get(),
+        },
+    )
 }
 
 pub fn maxsim_search<'b, R: RelationRead, O: Operator>(
@@ -331,18 +487,20 @@ where
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-        let mut callback = id_2(|(rough, err), head, payload, prefetch| {
-            let lowerbound = Distance::from_f32(rough - err * epsilon);
-            let rough = Distance::from_f32(rough);
-            results.push((
-                (Reverse(lowerbound), AlwaysEqual(rough)),
-                AlwaysEqual(PackedRefMut8(bump.alloc((
-                    payload,
-                    head,
-                    BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
-                )))),
-            ));
-        });
+        let mut callback = id_5(
+            |(rough, err), head, payload, _candidate_metadata, prefetch| {
+                let lowerbound = Distance::from_f32(rough - err * epsilon);
+                let rough = Distance::from_f32(rough);
+                results.push((
+                    (Reverse(lowerbound), AlwaysEqual(rough)),
+                    AlwaysEqual(PackedRefMut8(bump.alloc((
+                        payload,
+                        head,
+                        BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
+                    )))),
+                ));
+            },
+        );
         if prefetch_h0_tuples.is_not_plain() {
             let directory =
                 tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));

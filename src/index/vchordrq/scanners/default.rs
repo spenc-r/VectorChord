@@ -13,33 +13,362 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::index::fetcher::*;
+use crate::index::gucs::MetadataPrefilterMode;
 use crate::index::opclass::Sphere;
 use crate::index::scanners::{Io, SearchBuilder};
+use crate::index::vchordrq::am::metadata::MetadataColumnKind;
 use crate::index::vchordrq::dispatch::*;
-use crate::index::vchordrq::filter::filter;
+use crate::index::vchordrq::filter::{HeapBlockKey, WindowFilterStats, window_filter};
 use crate::index::vchordrq::opclass::Opfamily;
-use crate::index::vchordrq::scanners::SearchOptions;
+use crate::index::vchordrq::scanners::{
+    MetadataPrefilterOptions, SearchInstrumentation, SearchOptions,
+};
 use crate::recorder::{Recorder, text};
 use always_equal::AlwaysEqual;
 use dary_heap::QuaternaryHeap as Heap;
 use index::accessor::{Dot, L2S};
+use distance::Distance;
 use index::bump::Bump;
-use index::packed::PackedRefMut4;
+use index::fetch::BorrowedIter;
+use index::packed::{PackedRefMut, PackedRefMut4};
 use index::prefetcher::*;
 use index::relation::{Hints, Page, RelationPrefetch, RelationRead, RelationReadStream};
 use simd::f16;
+use std::cmp::Reverse;
 use std::num::NonZero;
+use std::time::Instant;
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
-use vchordrq::{RerankMethod, default_search, how, rerank_heap, rerank_index};
+use vchordrq::{
+    BlockPrune, CandidateMetadata, RerankMethod,
+    default_search_with_candidate_filter_and_block_prune, how, rerank_heap_instrumented,
+    rerank_index_instrumented,
+};
 use vector::VectorOwned;
 use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
 use vector::vect::VectOwned;
 
+type CandidateItem<'b> = (
+    (Reverse<Distance>, AlwaysEqual<()>),
+    AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, CandidateMetadata, BorrowedIter<'b>)>>,
+);
+
+impl HeapBlockKey for ([u16; 3], NonZero<u64>, CandidateMetadata) {
+    fn heap_block_key(self) -> [u16; 3] {
+        self.0
+    }
+}
+
+fn candidate_heap_key(item: &CandidateItem<'_>) -> ([u16; 3], NonZero<u64>, CandidateMetadata) {
+    let packed = &item.1.0;
+    let (pointer, _, metadata, _) = packed.get();
+    let (key, _) = pointer_to_kv(*pointer);
+    (key, *pointer, *metadata)
+}
+
 pub struct DefaultBuilder {
     opfamily: Opfamily,
     orderbys: Vec<Option<OwnedVector>>,
     spheres: Vec<Option<Sphere<OwnedVector>>>,
+}
+
+fn instrumented_default_search<'b, R, O>(
+    instrumentation: Option<&SearchInstrumentation>,
+    metadata_prefilter: MetadataPrefilterOptions,
+    _fetcher: &mut impl Fetcher,
+    index: &'b R,
+    vector: <O::Vector as VectorOwned>::Borrowed<'_>,
+    probes: Vec<u32>,
+    epsilon: f32,
+    bump: &'b impl Bump,
+    prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
+    prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
+) -> Vec<(
+    (Reverse<Distance>, AlwaysEqual<()>),
+    AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, CandidateMetadata, BorrowedIter<'b>)>>,
+)>
+where
+    R: RelationRead,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
+    O: vchordrq::operator::Operator,
+{
+    let started_at = Instant::now();
+    let block_prune_enabled = metadata_prefilter.block_prune
+        && metadata_prefilter.mode != MetadataPrefilterMode::Off
+        && !metadata_prefilter.predicates.is_empty();
+    let (results, search_stats) = default_search_with_candidate_filter_and_block_prune::<R, O>(
+        index,
+        vector,
+        probes,
+        epsilon,
+        bump,
+        prefetch_h1_vectors,
+        prefetch_h0_tuples,
+        |_, _| true,
+        |candidate_metadata, payload| {
+            if !block_prune_enabled {
+                return BlockPrune::Disabled;
+            }
+            if block_summary_rejects(candidate_metadata, payload, &metadata_prefilter) {
+                BlockPrune::Skip
+            } else {
+                BlockPrune::Scan
+            }
+        },
+    );
+    if let Some(instrumentation) = instrumentation {
+        instrumentation.add_build_time(started_at.elapsed());
+        instrumentation.set_default_search_stats(search_stats);
+    }
+    results
+}
+
+fn block_summary_rejects(
+    candidate_metadata: &[CandidateMetadata; 32],
+    payload: &[Option<NonZero<u64>>; 32],
+    metadata_prefilter: &MetadataPrefilterOptions,
+) -> bool {
+    let mut saw_candidate = false;
+    for (metadata, payload) in candidate_metadata.iter().zip(payload.iter()) {
+        if payload.is_none() {
+            continue;
+        }
+        saw_candidate = true;
+        if candidate_metadata_definitely_rejected(*metadata, &metadata_prefilter.predicates)
+            .is_none()
+        {
+            return false;
+        }
+    }
+    saw_candidate
+}
+
+fn candidate_metadata_definitely_rejected(
+    candidate_metadata: CandidateMetadata,
+    predicates: &[crate::index::vchordrq::am::metadata_qual::MetadataPredicate],
+) -> Option<MetadataColumnKind> {
+    for predicate in predicates {
+        match predicate.is_definitely_false(candidate_metadata) {
+            Some(true) => return Some(predicate.kind),
+            Some(false) => {}
+            None => return None,
+        }
+    }
+    None
+}
+
+fn metadata_candidate_allows(
+    payload: NonZero<u64>,
+    candidate_metadata: CandidateMetadata,
+    metadata_prefilter: &MetadataPrefilterOptions,
+    fetcher: &mut impl Fetcher,
+    instrumentation: Option<&SearchInstrumentation>,
+) -> bool {
+    if metadata_prefilter.mode == MetadataPrefilterMode::Off {
+        return true;
+    }
+    if metadata_prefilter.predicates.is_empty() {
+        return true;
+    };
+    if let Some(instrumentation) = instrumentation {
+        instrumentation.increment_metadata_checked();
+    }
+    let started_at = Instant::now();
+    let mut maybe = false;
+    let mut rejected_by = None;
+    for predicate in &metadata_prefilter.predicates {
+        match predicate.is_definitely_false(candidate_metadata) {
+            Some(true) => {
+                rejected_by = Some(predicate.kind);
+                break;
+            }
+            Some(false) => {}
+            None => {
+                maybe = true;
+            }
+        }
+    }
+    if let Some(instrumentation) = instrumentation {
+        instrumentation.add_metadata_eval_time(started_at.elapsed());
+    }
+    if let Some(rejected_by) = rejected_by {
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.increment_metadata_rejected();
+            instrumentation.increment_metadata_rejected_by(rejected_by);
+            instrumentation.increment_heap_prefilter_avoided();
+        }
+    } else {
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.increment_metadata_survived();
+            if maybe {
+                instrumentation.increment_metadata_maybe();
+            } else {
+                instrumentation.increment_metadata_true();
+            }
+        }
+        return true;
+    }
+    let rejected_by = rejected_by.expect("metadata reject kind must be set");
+    if metadata_prefilter.debug {
+        let (key, _) = pointer_to_kv(payload);
+        if run_prefilter(fetcher, key, None, false) {
+            if let Some(instrumentation) = instrumentation {
+                instrumentation.increment_metadata_false_negative_debug();
+            }
+            pgrx::error!(
+                "vchordrq metadata prefilter false negative for kind={}",
+                rejected_by.active_name()
+            );
+        }
+    }
+    false
+}
+
+fn run_prefilter(
+    fetcher: &mut impl Fetcher,
+    key: [u16; 3],
+    instrumentation: Option<&SearchInstrumentation>,
+    count: bool,
+) -> bool {
+    if count {
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.increment_prefilter_checked();
+            instrumentation.increment_heap_prefilter_after_metadata();
+        }
+    }
+    let started_at = Instant::now();
+    let Some(mut tuple) = fetcher.fetch(key) else {
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.add_prefilter_fetch_time(started_at.elapsed());
+        }
+        return false;
+    };
+    if let Some(instrumentation) = instrumentation {
+        instrumentation.add_prefilter_fetch_time(started_at.elapsed());
+    }
+    let started_at = Instant::now();
+    let passed = tuple.filter();
+    if let Some(instrumentation) = instrumentation {
+        instrumentation.add_prefilter_filter_time(started_at.elapsed());
+        if passed {
+            instrumentation.increment_prefilter_passed();
+        }
+    }
+    passed
+}
+
+fn instrumented_prefilter(
+    fetcher: &mut impl Fetcher,
+    key: [u16; 3],
+    instrumentation: Option<&SearchInstrumentation>,
+) -> bool {
+    run_prefilter(fetcher, key, instrumentation, true)
+}
+
+fn metadata_heap_prefilter_allows(
+    fetcher: &mut impl Fetcher,
+    key: [u16; 3],
+    candidate_metadata: CandidateMetadata,
+    instrumentation: Option<&SearchInstrumentation>,
+    metadata_prefilter: &MetadataPrefilterOptions,
+) -> bool {
+    if metadata_prefilter.can_skip_heap_prefilter() {
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.increment_heap_prefilter_after_metadata();
+            instrumentation.record_residual_result(true);
+        }
+        true
+    } else {
+        let passed = instrumented_prefilter(fetcher, key, instrumentation);
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.record_residual_result(passed);
+            if !passed {
+                record_hypothetical_rejects(
+                    candidate_metadata,
+                    &metadata_prefilter.hypothetical_predicates,
+                    instrumentation,
+                );
+            }
+        }
+        passed
+    }
+}
+
+fn record_hypothetical_rejects(
+    candidate_metadata: CandidateMetadata,
+    predicates: &[crate::index::vchordrq::am::metadata_qual::MetadataPredicate],
+    instrumentation: &SearchInstrumentation,
+) {
+    let mut rejected = std::collections::BTreeSet::new();
+    for predicate in predicates {
+        if predicate
+            .is_definitely_false(candidate_metadata)
+            .unwrap_or(false)
+        {
+            rejected.insert(predicate.kind);
+            instrumentation.increment_hypothetical_reject_by(predicate.kind);
+        }
+    }
+    let feed_flags = rejected.contains(&MetadataColumnKind::Feed)
+        || rejected.contains(&MetadataColumnKind::Flags)
+        || rejected.contains(&MetadataColumnKind::Status)
+        || rejected.contains(&MetadataColumnKind::Deleted)
+        || rejected.contains(&MetadataColumnKind::Visibility);
+    if feed_flags {
+        instrumentation.increment_hypothetical_feed_flags();
+    }
+    if feed_flags || rejected.contains(&MetadataColumnKind::Geo) {
+        instrumentation.increment_hypothetical_feed_flags_geo();
+    }
+    if feed_flags
+        || rejected.contains(&MetadataColumnKind::Geo)
+        || rejected.contains(&MetadataColumnKind::Time)
+    {
+        instrumentation.increment_hypothetical_feed_flags_geo_time();
+    }
+}
+
+fn boxed_rerank_index<'b, R, O, S, M>(
+    io: Io,
+    _vector_read_window: usize,
+    index: &'b R,
+    sequence: S,
+    vector: O::Vector,
+    rerank_hints: Hints,
+    instrumentation: Option<vchordrq::RerankInstrumentation>,
+    map: M,
+) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
+where
+    R: RelationRead + RelationPrefetch + RelationReadStream + 'b,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
+    O: vchordrq::operator::Operator + 'b,
+    O::Vector: 'b,
+    S: Sequence<Item = CandidateItem<'b>> + 'b,
+    M: FnMut((Distance, NonZero<u64>)) -> (f32, NonZero<u64>) + 'b,
+{
+    match io {
+        Io::Plain => {
+            let prefetcher = PlainPrefetcher::new(index, sequence);
+            Box::new(
+                rerank_index_instrumented::<O, _, _, _>(vector, prefetcher, instrumentation)
+                    .map(map),
+            )
+        }
+        Io::Simple => {
+            let prefetcher = SimplePrefetcher::new(index, sequence);
+            Box::new(
+                rerank_index_instrumented::<O, _, _, _>(vector, prefetcher, instrumentation)
+                    .map(map),
+            )
+        }
+        Io::Stream => {
+            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
+            Box::new(
+                rerank_index_instrumented::<O, _, _, _>(vector, prefetcher, instrumentation)
+                    .map(map),
+            )
+        }
+    }
 }
 
 impl SearchBuilder for DefaultBuilder {
@@ -119,8 +448,16 @@ impl SearchBuilder for DefaultBuilder {
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
-        let search_hints = Hints::default().full(true);
-        let rerank_hints = Hints::default().full(false);
+        let instrumentation = options.instrumentation.clone();
+        let rerank_instrumentation = instrumentation
+            .as_ref()
+            .map(SearchInstrumentation::rerank_instrumentation);
+        let prefilter_window = options.prefilter_window;
+        let vector_read_window = options.vector_read_window;
+        let search_hints = Hints::default().full(true).batch(options.read_stream_batch);
+        let rerank_hints = Hints::default()
+            .full(false)
+            .batch(options.read_stream_batch);
         let make_h1_plain_prefetcher = MakeH1PlainPrefetcher { index };
         let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
         let make_h0_simple_prefetcher = MakeH0SimplePrefetcher { index };
@@ -140,7 +477,10 @@ impl SearchBuilder for DefaultBuilder {
                     };
                     let projected = RandomProject::project(unprojected.as_borrowed());
                     let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
+                        Io::Plain => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -149,7 +489,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
                         ),
-                        Io::Simple => default_search::<_, Op>(
+                        Io::Simple => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -158,7 +501,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
                         ),
-                        Io::Stream => default_search::<_, Op>(
+                        Io::Stream => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -172,55 +518,169 @@ impl SearchBuilder for DefaultBuilder {
                     let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Heap, _, false) => {
                             let fetch = move |payload| {
@@ -240,7 +700,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                         (RerankMethod::Heap, _, true) => {
@@ -264,7 +730,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                     }
@@ -278,7 +750,10 @@ impl SearchBuilder for DefaultBuilder {
                     };
                     let projected = RandomProject::project(unprojected.as_borrowed());
                     let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
+                        Io::Plain => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -287,7 +762,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
                         ),
-                        Io::Simple => default_search::<_, Op>(
+                        Io::Simple => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -296,7 +774,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
                         ),
-                        Io::Stream => default_search::<_, Op>(
+                        Io::Stream => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -310,55 +791,169 @@ impl SearchBuilder for DefaultBuilder {
                     let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Heap, _, false) => {
                             let fetch = move |payload| {
@@ -378,7 +973,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                         (RerankMethod::Heap, _, true) => {
@@ -402,7 +1003,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                     }
@@ -416,7 +1023,10 @@ impl SearchBuilder for DefaultBuilder {
                     };
                     let projected = RandomProject::project(unprojected.as_borrowed());
                     let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
+                        Io::Plain => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -425,7 +1035,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
                         ),
-                        Io::Simple => default_search::<_, Op>(
+                        Io::Simple => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -434,7 +1047,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
                         ),
-                        Io::Stream => default_search::<_, Op>(
+                        Io::Stream => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -448,55 +1064,169 @@ impl SearchBuilder for DefaultBuilder {
                     let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Heap, _, false) => {
                             let fetch = move |payload| {
@@ -516,7 +1246,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                         (RerankMethod::Heap, _, true) => {
@@ -540,7 +1276,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                     }
@@ -554,7 +1296,10 @@ impl SearchBuilder for DefaultBuilder {
                     };
                     let projected = RandomProject::project(unprojected.as_borrowed());
                     let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
+                        Io::Plain => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -563,7 +1308,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
                         ),
-                        Io::Simple => default_search::<_, Op>(
+                        Io::Simple => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -572,7 +1320,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
                         ),
-                        Io::Stream => default_search::<_, Op>(
+                        Io::Stream => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             projected.as_borrowed(),
                             options.probes,
@@ -586,55 +1337,169 @@ impl SearchBuilder for DefaultBuilder {
                     let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Heap, _, false) => {
                             let fetch = move |payload| {
@@ -654,7 +1519,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                         (RerankMethod::Heap, _, true) => {
@@ -678,7 +1549,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                     }
@@ -691,7 +1568,10 @@ impl SearchBuilder for DefaultBuilder {
                         unreachable!()
                     };
                     let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
+                        Io::Plain => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -700,7 +1580,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
                         ),
-                        Io::Simple => default_search::<_, Op>(
+                        Io::Simple => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -709,7 +1592,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
                         ),
-                        Io::Stream => default_search::<_, Op>(
+                        Io::Stream => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -723,55 +1609,169 @@ impl SearchBuilder for DefaultBuilder {
                     let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Heap, _, false) => {
                             let fetch = move |payload| {
@@ -791,7 +1791,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                         (RerankMethod::Heap, _, true) => {
@@ -815,7 +1821,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                     }
@@ -828,7 +1840,10 @@ impl SearchBuilder for DefaultBuilder {
                         unreachable!()
                     };
                     let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
+                        Io::Plain => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -837,7 +1852,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
                         ),
-                        Io::Simple => default_search::<_, Op>(
+                        Io::Simple => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -846,7 +1864,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
                         ),
-                        Io::Stream => default_search::<_, Op>(
+                        Io::Stream => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -860,55 +1881,169 @@ impl SearchBuilder for DefaultBuilder {
                     let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Heap, _, false) => {
                             let fetch = move |payload| {
@@ -928,7 +2063,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                         (RerankMethod::Heap, _, true) => {
@@ -952,7 +2093,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                     }
@@ -965,7 +2112,10 @@ impl SearchBuilder for DefaultBuilder {
                         unreachable!()
                     };
                     let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
+                        Io::Plain => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -974,7 +2124,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
                         ),
-                        Io::Simple => default_search::<_, Op>(
+                        Io::Simple => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -983,7 +2136,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
                         ),
-                        Io::Stream => default_search::<_, Op>(
+                        Io::Stream => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -997,55 +2153,169 @@ impl SearchBuilder for DefaultBuilder {
                     let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Heap, _, false) => {
                             let fetch = move |payload| {
@@ -1065,7 +2335,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                         (RerankMethod::Heap, _, true) => {
@@ -1089,7 +2365,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                     }
@@ -1102,7 +2384,10 @@ impl SearchBuilder for DefaultBuilder {
                         unreachable!()
                     };
                     let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
+                        Io::Plain => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -1111,7 +2396,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_plain_prefetcher,
                         ),
-                        Io::Simple => default_search::<_, Op>(
+                        Io::Simple => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -1120,7 +2408,10 @@ impl SearchBuilder for DefaultBuilder {
                             make_h1_plain_prefetcher,
                             make_h0_simple_prefetcher,
                         ),
-                        Io::Stream => default_search::<_, Op>(
+                        Io::Stream => instrumented_default_search::<_, Op>(
+                            instrumentation.as_ref(),
+                            options.metadata_prefilter.clone(),
+                            &mut fetcher,
                             index,
                             unprojected.as_borrowed(),
                             options.probes,
@@ -1134,55 +2425,169 @@ impl SearchBuilder for DefaultBuilder {
                     let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Plain,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Simple,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
+                            let instrumentation = instrumentation.clone();
+                            let window_instrumentation = instrumentation.clone();
+                            let key = candidate_heap_key;
+                            let metadata_prefilter = options.metadata_prefilter.clone();
+                            let predicate = move |(key, payload, candidate_metadata)| {
+                                metadata_candidate_allows(
+                                    payload,
+                                    candidate_metadata,
+                                    &metadata_prefilter,
+                                    &mut fetcher,
+                                    instrumentation.as_ref(),
+                                ) && metadata_heap_prefilter_allows(
+                                    &mut fetcher,
+                                    key,
+                                    candidate_metadata,
+                                    instrumentation.as_ref(),
+                                    &metadata_prefilter,
+                                )
+                            };
+                            let observer = move |stats: WindowFilterStats| {
+                                if let Some(instrumentation) = &window_instrumentation {
+                                    instrumentation.add_prefilter_window(
+                                        stats.duration,
+                                        stats.candidates,
+                                        stats.heap_blocks,
+                                        stats.passed,
+                                    );
+                                }
+                            };
+                            let sequence =
+                                window_filter(sequence, prefilter_window, key, predicate, observer);
+                            boxed_rerank_index::<_, Op, _, _>(
+                                Io::Stream,
+                                vector_read_window,
+                                index,
+                                sequence,
+                                unprojected,
+                                rerank_hints,
+                                rerank_instrumentation.clone(),
+                                f,
+                            )
                         }
                         (RerankMethod::Heap, _, false) => {
                             let fetch = move |payload| {
@@ -1202,7 +2607,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                         (RerankMethod::Heap, _, true) => {
@@ -1226,7 +2637,13 @@ impl SearchBuilder for DefaultBuilder {
                             };
                             let prefetcher = PlainPrefetcher::new(index, sequence);
                             Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
+                                rerank_heap_instrumented::<Op, _, _, _>(
+                                    unprojected,
+                                    prefetcher,
+                                    fetch,
+                                    rerank_instrumentation.clone(),
+                                )
+                                .map(f),
                             )
                         }
                     }

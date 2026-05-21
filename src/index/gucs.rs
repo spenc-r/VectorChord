@@ -27,6 +27,26 @@ pub enum PostgresIo {
     ReadStream,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PostgresGucEnum)]
+pub enum MetadataPrefilterMode {
+    #[name = c"off"]
+    Off,
+    #[name = c"reject_only"]
+    RejectOnly,
+    #[name = c"covered_skip_heap"]
+    CoveredSkipHeap,
+}
+
+impl MetadataPrefilterMode {
+    pub const fn as_guc_name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::RejectOnly => "reject_only",
+            Self::CoveredSkipHeap => "covered_skip_heap",
+        }
+    }
+}
+
 static VCHORDRQ_QUERY_SAMPLING_ENABLE: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 static VCHORDRQ_QUERY_SAMPLING_MAX_RECORDS: GucSetting<i32> = GucSetting::<i32>::new(0);
@@ -93,6 +113,18 @@ static VCHORDRQ_IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::ne
     #[cfg(any(feature = "pg17", feature = "pg18"))]
     PostgresIo::ReadStream,
 );
+
+static VCHORDRQ_METADATA_QUAL_DIAGNOSTICS: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+static VCHORDRQ_METADATA_PREFILTER: GucSetting<MetadataPrefilterMode> =
+    GucSetting::<MetadataPrefilterMode>::new(MetadataPrefilterMode::Off);
+
+static VCHORDRQ_METADATA_PREFILTER_DEBUG: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+static VCHORDRQ_METADATA_ACTIVE_COLUMNS: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c""));
+
+static VCHORDRQ_METADATA_BLOCK_PRUNE: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 pub fn init() {
     GucRegistry::define_bool_guc(
@@ -172,6 +204,46 @@ pub fn init() {
         c"`io_rerank` argument of vchordrq.",
         c"`io_rerank` argument of vchordrq.",
         &VCHORDRQ_IO_RERANK,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"vchordrq.metadata_qual_diagnostics",
+        c"Emit per-scan vchordrq metadata qual visibility diagnostics.",
+        c"Emit per-scan vchordrq metadata qual visibility diagnostics.",
+        &VCHORDRQ_METADATA_QUAL_DIAGNOSTICS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_enum_guc(
+        c"vchordrq.metadata_prefilter",
+        c"Use index-resident metadata to reject vchordrq candidates before heap prefilter.",
+        c"Use index-resident metadata to reject vchordrq candidates before heap prefilter.",
+        &VCHORDRQ_METADATA_PREFILTER,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"vchordrq.metadata_prefilter_debug",
+        c"Verify sampled metadata rejects against the heap prefilter.",
+        c"Verify sampled metadata rejects against the heap prefilter.",
+        &VCHORDRQ_METADATA_PREFILTER_DEBUG,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"vchordrq.metadata_active_columns",
+        c"Comma-separated vchordrq metadata predicates to activate.",
+        c"Comma-separated vchordrq metadata predicates to activate.",
+        &VCHORDRQ_METADATA_ACTIVE_COLUMNS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"vchordrq.metadata_block_prune",
+        c"Enable experimental vchordrq metadata block pruning.",
+        c"Enable experimental vchordrq metadata block pruning.",
+        &VCHORDRQ_METADATA_BLOCK_PRUNE,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -492,6 +564,29 @@ pub fn vchordrq_io_rerank() -> Io {
         #[cfg(any(feature = "pg17", feature = "pg18"))]
         PostgresIo::ReadStream => Io::Stream,
     }
+}
+
+pub fn vchordrq_metadata_qual_diagnostics() -> bool {
+    VCHORDRQ_METADATA_QUAL_DIAGNOSTICS.get()
+}
+
+pub fn vchordrq_metadata_prefilter() -> MetadataPrefilterMode {
+    VCHORDRQ_METADATA_PREFILTER.get()
+}
+
+pub fn vchordrq_metadata_prefilter_debug() -> bool {
+    VCHORDRQ_METADATA_PREFILTER_DEBUG.get()
+}
+
+pub fn vchordrq_metadata_active_columns() -> String {
+    VCHORDRQ_METADATA_ACTIVE_COLUMNS
+        .get()
+        .and_then(|value| value.to_str().ok().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+pub fn vchordrq_metadata_block_prune() -> bool {
+    VCHORDRQ_METADATA_BLOCK_PRUNE.get()
 }
 
 pub fn vchordrq_query_sampling_enable() -> bool {

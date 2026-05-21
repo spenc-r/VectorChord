@@ -12,7 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
+use crate::closure_lifetime_binder::{id_0, id_1, id_3, id_5};
 use crate::operator::{Operator, Vector};
 use crate::tape_writer::{DirectoryTapeWriter, FrozenTapeWriter};
 use crate::tuples::*;
@@ -125,17 +125,20 @@ where
         let mut trace_appendable = Vec::new();
 
         let mut tuples = 0_u64;
-        let mut callback = id_2(|(code, delta): (_, _), head, payload, prefetch: &[_]| {
-            tape.push(Branch {
-                code,
-                delta,
-                prefetch: prefetch.to_vec(),
-                head,
-                norm: 0.0,
-                extra: payload,
-            });
-            tuples += 1;
-        });
+        let mut callback = id_5(
+            |(code, delta): (_, _), head, payload, candidate_metadata, prefetch: &[_]| {
+                tape.push(Branch {
+                    code,
+                    delta,
+                    prefetch: prefetch.to_vec(),
+                    head,
+                    norm: 0.0,
+                    extra: payload,
+                    candidate_metadata,
+                });
+                tuples += 1;
+            },
+        );
         let directory = tape::read_directory_tape::<R>(
             tape::by_next(index, *jump_tuple.directory_first())
                 .inspect(|_| check())
@@ -217,6 +220,7 @@ where
                 prefetch: branch.prefetch,
                 head: branch.head,
                 payload: Some(branch.extra),
+                candidate_metadata: branch.candidate_metadata,
             });
         }
 

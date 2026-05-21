@@ -12,6 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
+use crate::CandidateMetadata;
 use crate::operator::Vector;
 use index::tuples::{Bool, MutChecker, Padding, RefChecker};
 use std::num::NonZero;
@@ -1117,6 +1118,28 @@ struct FrozenTupleHeader1 {
     _padding_0: [Padding; 4],
 }
 
+const METADATA_TAIL_VERSION: u16 = 2;
+const FROZEN_METADATA_CANDIDATES: usize = 32;
+const APPENDABLE_METADATA_CANDIDATES: usize = 1;
+
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct MetadataTailHeader {
+    version: u16,
+    attr_count: u16,
+    candidate_count: u16,
+    _padding_0: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MetadataTailReader<'a> {
+    source: &'a [u8],
+    attr_count: usize,
+    candidate_count: usize,
+    valid_start: usize,
+    values_start: usize,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum FrozenTuple {
@@ -1124,6 +1147,7 @@ pub enum FrozenTuple {
         metadata: [[f32; 32]; 4],
         delta: [f32; 32],
         payload: [Option<NonZero<u64>>; 32],
+        candidate_metadata: [CandidateMetadata; 32],
         prefetch: Vec<[u32; 32]>,
         head: [u16; 32],
         elements: Vec<[u8; 16]>,
@@ -1135,11 +1159,21 @@ pub enum FrozenTuple {
 
 impl FrozenTuple {
     pub fn estimate_size_0(prefetch: usize, elements: usize) -> usize {
+        Self::estimate_size_0_with_metadata(prefetch, elements, 0)
+    }
+    pub fn estimate_size_0_with_metadata(
+        prefetch: usize,
+        elements: usize,
+        metadata_attr_count: usize,
+    ) -> usize {
         let mut size = 0_usize;
         size += size_of::<Tag>();
         size += size_of::<FrozenTupleHeader0>();
         size += (prefetch * size_of::<[u32; 32]>()).next_multiple_of(ALIGN);
         size += (elements * size_of::<[u8; 16]>()).next_multiple_of(ALIGN);
+        if metadata_attr_count > 0 {
+            size += metadata_tail_size(metadata_attr_count, FROZEN_METADATA_CANDIDATES);
+        }
         size
     }
     pub fn fit_1(prefetch: usize, freespace: u16) -> Option<usize> {
@@ -1167,6 +1201,7 @@ impl Tuple for FrozenTuple {
                 metadata,
                 delta,
                 payload,
+                candidate_metadata,
                 prefetch,
                 head,
                 elements,
@@ -1186,6 +1221,9 @@ impl Tuple for FrozenTuple {
                 let elements_e = buffer.len() as u16;
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
+                }
+                if let Some(tail) = frozen_metadata_tail_from_candidates(candidate_metadata) {
+                    buffer.extend(tail);
                 }
                 // header
                 buffer[size_of::<Tag>()..][..size_of::<FrozenTupleHeader0>()].copy_from_slice(
@@ -1238,10 +1276,12 @@ impl WithReader for FrozenTuple {
                 let header: &FrozenTupleHeader0 = checker.prefix(size_of::<Tag>());
                 let prefetch = checker.bytes(header.prefetch_s, header.prefetch_e);
                 let elements = checker.bytes(header.elements_s, header.elements_e);
+                let candidate_metadata = read_frozen_metadata_tail(source, header.elements_e);
                 FrozenTupleReader::_0(FrozenTupleReader0 {
                     header,
                     prefetch,
                     elements,
+                    candidate_metadata,
                 })
             }
             1 => {
@@ -1289,6 +1329,7 @@ pub struct FrozenTupleReader0<'a> {
     header: &'a FrozenTupleHeader0,
     prefetch: &'a [[u32; 32]],
     elements: &'a [[u8; 16]],
+    candidate_metadata: Option<MetadataTailReader<'a>>,
 }
 
 impl<'a> FrozenTupleReader0<'a> {
@@ -1309,6 +1350,12 @@ impl<'a> FrozenTupleReader0<'a> {
     }
     pub fn elements(self) -> &'a [[u8; 16]] {
         self.elements
+    }
+    pub fn candidate_metadata(self, index: usize) -> CandidateMetadata {
+        let Some(tail) = self.candidate_metadata else {
+            return CandidateMetadata::default();
+        };
+        tail.candidate_metadata(index)
     }
 }
 
@@ -1375,6 +1422,7 @@ pub struct AppendableTuple {
     pub head: u16,
     pub elements: Vec<u64>,
     pub payload: Option<NonZero<u64>>,
+    pub candidate_metadata: CandidateMetadata,
 }
 
 impl Tuple for AppendableTuple {
@@ -1394,6 +1442,9 @@ impl Tuple for AppendableTuple {
         let elements_e = buffer.len() as u16;
         while buffer.len() % ALIGN != 0 {
             buffer.push(0);
+        }
+        if let Some(tail) = appendable_metadata_tail_from_candidate(self.candidate_metadata) {
+            buffer.extend(tail);
         }
         // header
         buffer[..size_of::<AppendableTupleHeader>()].copy_from_slice(
@@ -1422,10 +1473,12 @@ impl WithReader for AppendableTuple {
         let header: &AppendableTupleHeader = checker.prefix(0_u16);
         let prefetch = checker.bytes(header.prefetch_s, header.prefetch_e);
         let elements = checker.bytes(header.elements_s, header.elements_e);
+        let candidate_metadata = read_appendable_metadata_tail(source, header.elements_e);
         AppendableTupleReader {
             header,
             prefetch,
             elements,
+            candidate_metadata,
         }
     }
 }
@@ -1446,6 +1499,7 @@ pub struct AppendableTupleReader<'a> {
     header: &'a AppendableTupleHeader,
     prefetch: &'a [u32],
     elements: &'a [u64],
+    candidate_metadata: Option<MetadataTailReader<'a>>,
 }
 
 impl<'a> AppendableTupleReader<'a> {
@@ -1467,6 +1521,12 @@ impl<'a> AppendableTupleReader<'a> {
     pub fn elements(self) -> &'a [u64] {
         self.elements
     }
+    pub fn candidate_metadata(self) -> CandidateMetadata {
+        let Some(tail) = self.candidate_metadata else {
+            return CandidateMetadata::default();
+        };
+        tail.candidate_metadata(0)
+    }
 }
 
 #[derive(Debug)]
@@ -1479,5 +1539,155 @@ pub struct AppendableTupleWriter<'a> {
 impl AppendableTupleWriter<'_> {
     pub fn payload(&mut self) -> &mut Option<NonZero<u64>> {
         &mut self.header.payload
+    }
+}
+
+fn frozen_metadata_tail_from_candidates(
+    candidate_metadata: &[CandidateMetadata; 32],
+) -> Option<Vec<u8>> {
+    metadata_tail_from_candidates(candidate_metadata, FROZEN_METADATA_CANDIDATES)
+}
+
+fn appendable_metadata_tail_from_candidate(
+    candidate_metadata: CandidateMetadata,
+) -> Option<Vec<u8>> {
+    metadata_tail_from_candidates(&[candidate_metadata], APPENDABLE_METADATA_CANDIDATES)
+}
+
+fn read_frozen_metadata_tail(source: &[u8], elements_e: u16) -> Option<MetadataTailReader<'_>> {
+    read_metadata_tail(source, elements_e, FROZEN_METADATA_CANDIDATES)
+}
+
+fn read_appendable_metadata_tail(source: &[u8], elements_e: u16) -> Option<MetadataTailReader<'_>> {
+    read_metadata_tail(source, elements_e, APPENDABLE_METADATA_CANDIDATES)
+}
+
+fn metadata_tail_size(attr_count: usize, candidate_count: usize) -> usize {
+    let header = size_of::<MetadataTailHeader>();
+    let valid = attr_count * size_of::<u32>();
+    let values = attr_count * candidate_count * size_of::<i64>();
+    header + valid.next_multiple_of(ALIGN) + values
+}
+
+fn metadata_tail_from_candidates(
+    candidate_metadata: &[CandidateMetadata],
+    candidate_count: usize,
+) -> Option<Vec<u8>> {
+    let attr_count = candidate_metadata
+        .iter()
+        .map(|metadata| {
+            let valid = metadata.valid();
+            if valid == 0 {
+                0
+            } else {
+                (u32::BITS - valid.leading_zeros()) as usize
+            }
+        })
+        .max()
+        .unwrap_or(0)
+        .min(crate::MAX_METADATA_ATTRS);
+    if attr_count == 0 {
+        return None;
+    }
+    let mut buffer = Vec::new();
+    buffer.extend(
+        MetadataTailHeader {
+            version: METADATA_TAIL_VERSION,
+            attr_count: attr_count as u16,
+            candidate_count: candidate_count as u16,
+            _padding_0: 0,
+        }
+        .as_bytes(),
+    );
+    let valid_start = buffer.len();
+    buffer.resize(valid_start + attr_count * size_of::<u32>(), 0);
+    while buffer.len() % ALIGN != 0 {
+        buffer.push(0);
+    }
+    for attr in 0..attr_count {
+        let mut valid = 0_u32;
+        for (candidate, metadata) in candidate_metadata.iter().enumerate().take(candidate_count) {
+            if let Some(value) = metadata.get(attr) {
+                valid |= 1_u32 << candidate;
+                buffer.extend(value.to_ne_bytes());
+            } else {
+                buffer.extend(0_i64.to_ne_bytes());
+            }
+        }
+        buffer[valid_start + attr * size_of::<u32>()..][..size_of::<u32>()]
+            .copy_from_slice(&valid.to_ne_bytes());
+    }
+    Some(buffer)
+}
+
+fn read_metadata_tail(
+    source: &[u8],
+    elements_e: u16,
+    expected_candidate_count: usize,
+) -> Option<MetadataTailReader<'_>> {
+    let start = (elements_e as usize).next_multiple_of(ALIGN);
+    let header_end = start.checked_add(size_of::<MetadataTailHeader>())?;
+    if source.len() < header_end {
+        return None;
+    }
+    let header = {
+        #[allow(unsafe_code)]
+        unsafe {
+            &*source.as_ptr().add(start).cast::<MetadataTailHeader>()
+        }
+    };
+    if header.version != METADATA_TAIL_VERSION
+        || header.candidate_count as usize != expected_candidate_count
+        || header.attr_count as usize > crate::MAX_METADATA_ATTRS
+    {
+        return None;
+    }
+    let attr_count = header.attr_count as usize;
+    let valid_start = header_end;
+    let values_start = (valid_start + attr_count * size_of::<u32>()).next_multiple_of(ALIGN);
+    let values_len = attr_count
+        .checked_mul(expected_candidate_count)?
+        .checked_mul(size_of::<i64>())?;
+    let end = values_start.checked_add(values_len)?;
+    if source.len() < end {
+        return None;
+    }
+    Some(MetadataTailReader {
+        source,
+        attr_count,
+        candidate_count: expected_candidate_count,
+        valid_start,
+        values_start,
+    })
+}
+
+impl MetadataTailReader<'_> {
+    fn candidate_metadata(self, candidate_index: usize) -> CandidateMetadata {
+        if candidate_index >= self.candidate_count {
+            return CandidateMetadata::default();
+        }
+        let mut metadata = CandidateMetadata::default();
+        for attr in 0..self.attr_count {
+            let valid = self.read_u32(self.valid_start + attr * size_of::<u32>());
+            if valid & (1_u32 << candidate_index) == 0 {
+                continue;
+            }
+            let value_offset = self.values_start
+                + (attr * self.candidate_count + candidate_index) * size_of::<i64>();
+            metadata.set(attr, self.read_i64(value_offset));
+        }
+        metadata
+    }
+
+    fn read_u32(self, offset: usize) -> u32 {
+        let mut bytes = [0_u8; size_of::<u32>()];
+        bytes.copy_from_slice(&self.source[offset..offset + size_of::<u32>()]);
+        u32::from_ne_bytes(bytes)
+    }
+
+    fn read_i64(self, offset: usize) -> i64 {
+        let mut bytes = [0_u8; size_of::<i64>()];
+        bytes.copy_from_slice(&self.source[offset..offset + size_of::<i64>()]);
+        i64::from_ne_bytes(bytes)
     }
 }

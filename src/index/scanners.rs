@@ -29,6 +29,16 @@ pub enum Io {
     Stream,
 }
 
+impl Io {
+    pub fn as_guc_name(self) -> &'static str {
+        match self {
+            Self::Plain => "read_buffer",
+            Self::Simple => "prefetch_buffer",
+            Self::Stream => "read_stream",
+        }
+    }
+}
+
 pub trait SearchBuilder: 'static {
     type Options;
 

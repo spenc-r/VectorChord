@@ -270,7 +270,7 @@ pub fn read_h1_tape<'b, R, A, T>(
 pub fn read_frozen_tape<'b, R, A, T>(
     iter: impl Iterator<Item = R::ReadGuard<'b>>,
     accessor: impl Fn() -> A,
-    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32]),
+    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, crate::CandidateMetadata, &'a [u32]),
 ) where
     R: RelationRead + 'b,
     A: for<'a> Accessor1<[u8; 16], (&'a [[f32; 32]; 4], &'a [f32; 32]), Output = [T; 32]>,
@@ -294,6 +294,59 @@ pub fn read_frozen_tape<'b, R, A, T>(
                                 value,
                                 tuple.head()[j],
                                 payload,
+                                tuple.candidate_metadata(j),
+                                &flattened[j * step..][..step],
+                            );
+                        }
+                    }
+                }
+                FrozenTupleReader::_1(tuple) => {
+                    x.get_or_insert_with(&accessor).push(tuple.elements());
+                }
+            }
+        }
+    }
+}
+
+pub fn read_frozen_tape_with_block_prune<'b, R, A, T>(
+    iter: impl Iterator<Item = R::ReadGuard<'b>>,
+    accessor: impl Fn() -> A,
+    mut block_prune: impl FnMut(
+        &[crate::CandidateMetadata; 32],
+        &[Option<NonZero<u64>>; 32],
+    ) -> crate::search::BlockPrune,
+    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, crate::CandidateMetadata, &'a [u32]),
+) where
+    R: RelationRead + 'b,
+    A: for<'a> Accessor1<[u8; 16], (&'a [[f32; 32]; 4], &'a [f32; 32]), Output = [T; 32]>,
+{
+    let mut x = None;
+    for guard in iter {
+        for i in 1..=guard.len() {
+            let bytes = guard.get(i).expect("data corruption");
+            let tuple = FrozenTuple::deserialize_ref(bytes);
+            match tuple {
+                FrozenTupleReader::_0(tuple) => {
+                    let candidate_metadata = std::array::from_fn(|j| tuple.candidate_metadata(j));
+                    if block_prune(&candidate_metadata, tuple.payload())
+                        == crate::search::BlockPrune::Skip
+                    {
+                        let _ = x.take();
+                        continue;
+                    }
+                    let mut x = x.take().unwrap_or_else(&accessor);
+                    x.push(tuple.elements());
+                    let values = x.finish((tuple.metadata(), tuple.delta()));
+                    let prefetch = tuple.prefetch();
+                    let flattened = prefetch.as_flattened();
+                    let step = prefetch.len();
+                    for (j, value) in values.into_iter().enumerate() {
+                        if let Some(payload) = tuple.payload()[j] {
+                            callback(
+                                value,
+                                tuple.head()[j],
+                                payload,
+                                candidate_metadata[j],
                                 &flattened[j * step..][..step],
                             );
                         }
@@ -310,7 +363,7 @@ pub fn read_frozen_tape<'b, R, A, T>(
 pub fn read_appendable_tape<'b, R, T>(
     iter: impl Iterator<Item = R::ReadGuard<'b>>,
     mut access: impl for<'a> FnMut([f32; 4], &'a [u64], f32) -> T,
-    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32]),
+    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, crate::CandidateMetadata, &'a [u32]),
 ) where
     R: RelationRead + 'b,
 {
@@ -320,7 +373,13 @@ pub fn read_appendable_tape<'b, R, T>(
             let tuple = AppendableTuple::deserialize_ref(bytes);
             if let Some(payload) = tuple.payload() {
                 let value = access(tuple.metadata(), tuple.elements(), tuple.delta());
-                callback(value, tuple.head(), payload, tuple.prefetch());
+                callback(
+                    value,
+                    tuple.head(),
+                    payload,
+                    tuple.candidate_metadata(),
+                    tuple.prefetch(),
+                );
             }
         }
     }

@@ -13,14 +13,30 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::operator::*;
+use crate::rerank::RerankInstrumentation;
 use crate::tuples::*;
 use crate::{Opaque, tape};
 use index::accessor::TryAccessor1;
 use index::relation::{Page, PageGuard, RelationRead, RelationWrite};
 use std::num::NonZero;
+use std::time::Instant;
 use vector::VectorOwned;
 
 pub fn read<
+    'a,
+    R: RelationRead + 'a,
+    O: Operator,
+    A: TryAccessor1<<O::Vector as Vector>::Element, <O::Vector as Vector>::Metadata>,
+>(
+    prefetch: impl Iterator<Item = R::ReadGuard<'a>>,
+    head: u16,
+    payload: NonZero<u64>,
+    accessor: A,
+) -> Option<A::Output> {
+    read_with_instrumentation::<R, O, A>(prefetch, head, payload, accessor, None)
+}
+
+pub fn read_with_instrumentation<
     'a,
     R: RelationRead + 'a,
     O: Operator,
@@ -30,10 +46,12 @@ pub fn read<
     head: u16,
     payload: NonZero<u64>,
     accessor: A,
+    instrumentation: Option<&RerankInstrumentation>,
 ) -> Option<A::Output> {
     let mut cursor = Err(head);
     let mut result = accessor;
     while let Err(head) = cursor {
+        let started_at = Instant::now();
         let guard = prefetch.next()?;
         let bytes = guard.get(head)?;
         let tuple = VectorTuple::<O::Vector>::deserialize_ref(bytes);
@@ -43,13 +61,31 @@ pub fn read<
         if tuple.payload() != Some(payload) {
             return None;
         }
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.increment_index_vector_pages();
+            instrumentation.add_index_vector_read_time(started_at.elapsed());
+        }
+        let started_at = Instant::now();
         result.push(tuple.elements())?;
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.add_index_distance_time(started_at.elapsed());
+        }
         cursor = tuple.metadata_or_head();
     }
+    let started_at = Instant::now();
     if prefetch.next().is_some() {
         return None;
     }
-    result.finish(cursor.ok()?)
+    if let Some(instrumentation) = instrumentation {
+        instrumentation.add_index_vector_read_time(started_at.elapsed());
+    }
+    let metadata = cursor.ok()?;
+    let started_at = Instant::now();
+    let output = result.finish(metadata);
+    if let Some(instrumentation) = instrumentation {
+        instrumentation.add_index_distance_time(started_at.elapsed());
+    }
+    output
 }
 
 pub fn append<O: Operator, R: RelationRead + RelationWrite>(

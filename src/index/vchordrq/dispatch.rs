@@ -258,6 +258,7 @@ pub fn insert<R>(
     opfamily: Opfamily,
     index: &R,
     payload: NonZero<u64>,
+    candidate_metadata: vchordrq::CandidateMetadata,
     vector: OwnedVector,
     skip_freespaces: bool,
     skip_search: bool,
@@ -282,6 +283,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<VectOwned<f32>, L2S>>(
                 index,
                 payload,
+                candidate_metadata,
                 projected.as_borrowed(),
                 key,
                 bump,
@@ -302,6 +304,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<VectOwned<f32>, Dot>>(
                 index,
                 payload,
+                candidate_metadata,
                 projected.as_borrowed(),
                 key,
                 bump,
@@ -322,6 +325,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<VectOwned<f16>, L2S>>(
                 index,
                 payload,
+                candidate_metadata,
                 projected.as_borrowed(),
                 key,
                 bump,
@@ -342,6 +346,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<VectOwned<f16>, Dot>>(
                 index,
                 payload,
+                candidate_metadata,
                 projected.as_borrowed(),
                 key,
                 bump,
@@ -361,6 +366,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<Rabitq8Owned, Dot>>(
                 index,
                 payload,
+                candidate_metadata,
                 vector.as_borrowed(),
                 key,
                 bump,
@@ -380,6 +386,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<Rabitq8Owned, L2S>>(
                 index,
                 payload,
+                candidate_metadata,
                 vector.as_borrowed(),
                 key,
                 bump,
@@ -399,6 +406,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<Rabitq4Owned, Dot>>(
                 index,
                 payload,
+                candidate_metadata,
                 vector.as_borrowed(),
                 key,
                 bump,
@@ -418,6 +426,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<Rabitq4Owned, L2S>>(
                 index,
                 payload,
+                candidate_metadata,
                 vector.as_borrowed(),
                 key,
                 bump,

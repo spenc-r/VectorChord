@@ -14,6 +14,8 @@
 
 mod am_build;
 mod am_vacuumcleanup;
+pub(crate) mod metadata;
+pub(crate) mod metadata_qual;
 
 use crate::index::fetcher::*;
 use crate::index::gucs;
@@ -31,6 +33,7 @@ use std::num::NonZero;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
+use std::time::Instant;
 use vchordrq::InsertChooser;
 
 #[repr(C)]
@@ -206,6 +209,7 @@ const AM_HANDLER: pgrx::pg_sys::IndexAmRoutine = const {
 
     am_routine.amsupport = 1;
     am_routine.amcanorderbyop = true;
+    am_routine.amcaninclude = true;
 
     #[cfg(any(feature = "pg17", feature = "pg18"))]
     {
@@ -419,8 +423,11 @@ unsafe fn aminsertinner(
     }
 
     let opfamily = unsafe { opfamily(index_relation) };
+    let metadata_schema = unsafe { metadata::detect_schema(index_relation) };
     let index = unsafe { PostgresRelation::new(index_relation) };
     let datum = unsafe { (!is_null.add(0).read()).then_some(values.add(0).read()) };
+    let candidate_metadata =
+        unsafe { metadata::metadata_from_index_values(values, is_null, &metadata_schema) };
     let ctid = unsafe { ctid.read() };
     if let Some(store) = unsafe { datum.and_then(|x| opfamily.store(x)) } {
         for (vector, extra) in store {
@@ -432,6 +439,7 @@ unsafe fn aminsertinner(
                 opfamily,
                 &index,
                 payload,
+                candidate_metadata,
                 vector,
                 false,
                 false,
@@ -491,6 +499,8 @@ pub unsafe extern "C-unwind" fn ambeginscan(
         hack: None,
         scanning: LazyCell::new(Box::new(|| Box::new(std::iter::empty()))),
         bump: Box::new(bumpalo::Bump::new()),
+        instrumentation: None,
+        instrumentation_context: None,
     };
     unsafe {
         (*scan).opaque = CurrentMemoryContext.leak_and_drop_on_delete(scanner).cast();
@@ -520,19 +530,90 @@ pub unsafe extern "C-unwind" fn amrescan(
             );
         }
         let scanner = &mut *(*scan).opaque.cast::<Scanner>();
+        scanner.finish_instrumentation();
         scanner.scanning = LazyCell::new(Box::new(|| Box::new(std::iter::empty())));
         scanner.bump.reset();
         let opfamily = opfamily((*scan).indexRelation);
         let index = PostgresRelation::new((*scan).indexRelation);
+        let epsilon = gucs::vchordrq_epsilon((*scan).indexRelation);
+        let probes = gucs::vchordrq_probes((*scan).indexRelation);
+        let io_search = gucs::vchordrq_io_search();
+        let io_rerank = gucs::vchordrq_io_rerank();
+        let prefilter = gucs::vchordrq_prefilter();
+        let read_stream_batch = false;
+        let prefilter_window = 0;
+        let vector_read_window = 0;
+        let metadata_schema = metadata::detect_schema((*scan).indexRelation);
+        let metadata_active_columns =
+            metadata_qual::MetadataActiveColumns::parse(&gucs::vchordrq_metadata_active_columns());
+        let compiled_metadata_qual = metadata_qual::compile_scan_qual(
+            scan,
+            scanner.hack,
+            &metadata_schema,
+            &metadata_active_columns,
+        );
+        let compiled_hypothetical_metadata_qual = metadata_qual::compile_scan_qual(
+            scan,
+            scanner.hack,
+            &metadata_schema,
+            &metadata_qual::MetadataActiveColumns::parse("all"),
+        );
+        let metadata_prefilter = MetadataPrefilterOptions {
+            mode: gucs::vchordrq_metadata_prefilter(),
+            schema_cols: metadata_schema.cols(),
+            predicates: compiled_metadata_qual.predicates,
+            hypothetical_predicates: compiled_hypothetical_metadata_qual.predicates,
+            all_quals_covered: compiled_metadata_qual.all_quals_covered,
+            block_prune: gucs::vchordrq_metadata_block_prune(),
+            debug: gucs::vchordrq_metadata_prefilter_debug(),
+        };
+        let instrumentation: Option<SearchInstrumentation> = None;
+        if let Some(instrumentation) = &instrumentation {
+            instrumentation.set_metadata_qual_stats(
+                compiled_metadata_qual.supported_qual_count,
+                compiled_metadata_qual.unsupported_qual_count,
+                compiled_metadata_qual.all_quals_covered,
+                compiled_metadata_qual.unavailable_param_count,
+            );
+        }
+        scanner.instrumentation = instrumentation.clone();
+        scanner.instrumentation_context =
+            instrumentation.as_ref().map(|_| InstrumentationLogContext {
+                opfamily: format!("{opfamily:?}"),
+                probes: format_probes(&probes),
+                epsilon,
+                io_search: io_search.as_guc_name(),
+                io_rerank: io_rerank.as_guc_name(),
+                prefilter,
+                read_stream_batch,
+                prefilter_window,
+                vector_read_window,
+                metadata_prefilter_mode: metadata_prefilter.mode.as_guc_name(),
+                metadata_schema_cols: metadata_prefilter.schema_cols,
+                metadata_block_prune: metadata_prefilter.block_prune,
+            });
+        if gucs::vchordrq_metadata_qual_diagnostics() {
+            metadata_qual::log_scan_qual_diagnostics(
+                scan,
+                scanner.hack,
+                &metadata_schema,
+                &metadata_active_columns,
+            );
+        }
         let options = SearchOptions {
-            epsilon: gucs::vchordrq_epsilon((*scan).indexRelation),
-            probes: gucs::vchordrq_probes((*scan).indexRelation),
+            epsilon,
+            probes,
             max_scan_tuples: gucs::vchordrq_max_scan_tuples(),
             maxsim_refine: gucs::vchordrq_maxsim_refine((*scan).indexRelation),
             maxsim_threshold: gucs::vchordrq_maxsim_threshold((*scan).indexRelation),
-            io_search: gucs::vchordrq_io_search(),
-            io_rerank: gucs::vchordrq_io_rerank(),
-            prefilter: gucs::vchordrq_prefilter(),
+            io_search,
+            io_rerank,
+            prefilter,
+            read_stream_batch,
+            prefilter_window,
+            vector_read_window,
+            metadata_prefilter,
+            instrumentation,
         };
         let fetcher = {
             let hack = scanner.hack;
@@ -638,7 +719,17 @@ pub unsafe extern "C-unwind" fn amgettuple(
         pgrx::error!("scanning with a non-MVCC-compliant snapshot is not supported");
     }
     let scanner = unsafe { (*scan).opaque.cast::<Scanner>().as_mut().unwrap_unchecked() };
-    if let Some((_, key, recheck)) = scanner.scanning.deref_mut().next() {
+    let instrumentation = scanner.instrumentation.clone();
+    let iter = scanner.scanning.deref_mut();
+    let started_at = Instant::now();
+    let next = iter.next();
+    if let Some(instrumentation) = &instrumentation {
+        instrumentation.add_rerank_next_time(started_at.elapsed());
+    }
+    if let Some((_, key, recheck)) = next {
+        if let Some(instrumentation) = &instrumentation {
+            instrumentation.increment_emitted();
+        }
         unsafe {
             (*scan).xs_heaptid = key_to_ctid(key);
             (*scan).xs_recheck = recheck;
@@ -653,6 +744,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
 #[pgrx::pg_guard]
 pub unsafe extern "C-unwind" fn amendscan(scan: pgrx::pg_sys::IndexScanDesc) {
     let scanner = unsafe { &mut *(*scan).opaque.cast::<Scanner>() };
+    scanner.finish_instrumentation();
     scanner.scanning = LazyCell::new(Box::new(|| Box::new(std::iter::empty())));
     scanner.bump.reset();
 }
@@ -663,6 +755,131 @@ pub struct Scanner {
     pub hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>,
     scanning: LazyCell<Iter, Box<dyn FnOnce() -> Iter>>,
     bump: Box<bumpalo::Bump>,
+    instrumentation: Option<SearchInstrumentation>,
+    instrumentation_context: Option<InstrumentationLogContext>,
+}
+
+#[derive(Debug)]
+struct InstrumentationLogContext {
+    opfamily: String,
+    probes: String,
+    epsilon: f32,
+    io_search: &'static str,
+    io_rerank: &'static str,
+    prefilter: bool,
+    read_stream_batch: bool,
+    prefilter_window: usize,
+    vector_read_window: usize,
+    metadata_prefilter_mode: &'static str,
+    metadata_schema_cols: usize,
+    metadata_block_prune: bool,
+}
+
+impl Scanner {
+    fn finish_instrumentation(&mut self) {
+        let instrumentation = self.instrumentation.take();
+        let context = self.instrumentation_context.take();
+        let (Some(instrumentation), Some(context)) = (instrumentation, context) else {
+            return;
+        };
+        if !instrumentation.mark_logged() {
+            return;
+        }
+        let snapshot = instrumentation.snapshot();
+        pgrx::log!(
+            "vchordrq_scan_timing opfamily={} probes={} epsilon={} io_search={} io_rerank={} prefilter={} read_stream_batch={} prefilter_window={} vector_read_window={} metadata_prefilter_mode={} metadata_schema_cols={} metadata_block_prune={} candidate_count={} candidate_count_before_block_prune={} candidate_count_after_block_prune={} scored_count={} emitted_count={} prefilter_checked_count={} prefilter_passed_count={} index_vector_pages={} metadata_checked_count={} metadata_rejected_count={} metadata_survived_count={} metadata_true_count={} metadata_maybe_count={} metadata_rejected_by_feed_count={} metadata_rejected_by_flags_count={} metadata_rejected_by_status_count={} metadata_rejected_by_deleted_count={} metadata_rejected_by_visibility_count={} metadata_rejected_by_geo_count={} metadata_rejected_by_time_count={} residual_checked_count={} residual_passed_count={} residual_failed_count={} hypothetical_reject_feed_count={} hypothetical_reject_flags_count={} hypothetical_reject_status_count={} hypothetical_reject_deleted_count={} hypothetical_reject_visibility_count={} hypothetical_reject_geo_count={} hypothetical_reject_time_count={} hypothetical_reject_feed_flags_count={} hypothetical_reject_feed_flags_geo_count={} hypothetical_reject_feed_flags_geo_time_count={} metadata_supported_qual_count={} metadata_unsupported_qual_count={} metadata_all_quals_covered={} metadata_unavailable_param_count={} heap_prefilter_after_metadata_count={} heap_prefilter_avoided_count={} metadata_false_negative_count_debug={} block_summary_checked_count={} block_summary_rejected_count={} block_summary_maybe_count={} block_summary_candidates_skipped_count={} prefilter_window_count={} prefilter_window_candidates={} prefilter_window_heap_blocks={} prefilter_window_passed={} vector_window_count={} vector_window_candidates={} vector_window_pages={} vector_window_unique_pages={} build_ms={:.3} rerank_next_ms={:.3} metadata_eval_ms={:.3} metadata_decode_ms={:.3} prefetch_next_ms={:.3} prefilter_fetch_ms={:.3} prefilter_filter_ms={:.3} prefilter_window_ms={:.3} index_vector_read_ms={:.3} index_distance_ms={:.3} vector_window_ms={:.3} heap_fetch_ms={:.3} heap_distance_ms={:.3} total_scan_ms={:.3}",
+            context.opfamily,
+            context.probes,
+            context.epsilon,
+            context.io_search,
+            context.io_rerank,
+            context.prefilter,
+            context.read_stream_batch,
+            context.prefilter_window,
+            context.vector_read_window,
+            context.metadata_prefilter_mode,
+            context.metadata_schema_cols,
+            context.metadata_block_prune,
+            snapshot.candidate_count,
+            snapshot.candidate_count_before_block_prune,
+            snapshot.candidate_count_after_block_prune,
+            snapshot.scored_count,
+            snapshot.emitted_count,
+            snapshot.prefilter_checked_count,
+            snapshot.prefilter_passed_count,
+            snapshot.index_vector_pages,
+            snapshot.metadata_checked_count,
+            snapshot.metadata_rejected_count,
+            snapshot.metadata_survived_count,
+            snapshot.metadata_true_count,
+            snapshot.metadata_maybe_count,
+            snapshot.metadata_rejected_by_feed_count,
+            snapshot.metadata_rejected_by_flags_count,
+            snapshot.metadata_rejected_by_status_count,
+            snapshot.metadata_rejected_by_deleted_count,
+            snapshot.metadata_rejected_by_visibility_count,
+            snapshot.metadata_rejected_by_geo_count,
+            snapshot.metadata_rejected_by_time_count,
+            snapshot.residual_checked_count,
+            snapshot.residual_passed_count,
+            snapshot.residual_failed_count,
+            snapshot.hypothetical_reject_feed_count,
+            snapshot.hypothetical_reject_flags_count,
+            snapshot.hypothetical_reject_status_count,
+            snapshot.hypothetical_reject_deleted_count,
+            snapshot.hypothetical_reject_visibility_count,
+            snapshot.hypothetical_reject_geo_count,
+            snapshot.hypothetical_reject_time_count,
+            snapshot.hypothetical_reject_feed_flags_count,
+            snapshot.hypothetical_reject_feed_flags_geo_count,
+            snapshot.hypothetical_reject_feed_flags_geo_time_count,
+            snapshot.metadata_supported_qual_count,
+            snapshot.metadata_unsupported_qual_count,
+            snapshot.metadata_all_quals_covered,
+            snapshot.metadata_unavailable_param_count,
+            snapshot.heap_prefilter_after_metadata_count,
+            snapshot.heap_prefilter_avoided_count,
+            snapshot.metadata_false_negative_count_debug,
+            snapshot.block_summary_checked_count,
+            snapshot.block_summary_rejected_count,
+            snapshot.block_summary_maybe_count,
+            snapshot.block_summary_candidates_skipped_count,
+            snapshot.prefilter_window_count,
+            snapshot.prefilter_window_candidates,
+            snapshot.prefilter_window_heap_blocks,
+            snapshot.prefilter_window_passed,
+            snapshot.vector_window_count,
+            snapshot.vector_window_candidates,
+            snapshot.vector_window_pages,
+            snapshot.vector_window_unique_pages,
+            ns_to_ms(snapshot.build_ns),
+            ns_to_ms(snapshot.rerank_next_ns),
+            ns_to_ms(snapshot.metadata_eval_ns),
+            ns_to_ms(snapshot.metadata_decode_ns),
+            ns_to_ms(snapshot.prefetch_next_ns),
+            ns_to_ms(snapshot.prefilter_fetch_ns),
+            ns_to_ms(snapshot.prefilter_filter_ns),
+            ns_to_ms(snapshot.prefilter_window_ns),
+            ns_to_ms(snapshot.index_vector_read_ns),
+            ns_to_ms(snapshot.index_distance_ns),
+            ns_to_ms(snapshot.vector_window_ns),
+            ns_to_ms(snapshot.heap_fetch_ns),
+            ns_to_ms(snapshot.heap_distance_ns),
+            ns_to_ms(snapshot.total_ns),
+        );
+    }
+}
+
+fn ns_to_ms(ns: u128) -> f64 {
+    ns as f64 / 1_000_000.0
+}
+
+fn format_probes(probes: &[u32]) -> String {
+    probes
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 struct Index {
