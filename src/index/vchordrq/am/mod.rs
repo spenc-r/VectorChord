@@ -292,20 +292,31 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             *index_pages = 1.0;
             return;
         }
+        // Selectivity must reflect how many rows pass *all* heap-side
+        // restriction clauses, not only clauses matching an index key.
+        // Vchordrq indexes only the vector column, so equality / range /
+        // function-call clauses on other columns live in
+        // `baserel->baserestrictinfo` and are ignored by the index-quals
+        // path that other AMs use. Reporting `selectivity = 1.0` to the
+        // planner makes `cost_index()` price the index path as if every
+        // table tuple flowed through a per-tuple filter, which can inflate
+        // the estimated cost by 1-2 orders of magnitude when the filter is
+        // an expensive operator (PostGIS, JSONB, regex, etc.).
+        //
+        // `baserel->rows` is the planner's pre-computed estimate of rows
+        // that pass `baserestrictinfo` (set in `set_baserel_size_estimates`
+        // during the same planning pass). Dividing by `baserel->tuples`
+        // gives the selectivity the rest of the planner is already using.
+        // When stats are missing (`tuples <= 0`, e.g. on a never-analyzed
+        // table) we fall back to 1.0, matching the pre-fix behavior.
         let selectivity = {
-            use pgrx::pg_sys::{
-                JoinType, add_predicate_to_index_quals, clauselist_selectivity,
-                get_quals_from_indexclauses,
-            };
-            let index_quals = get_quals_from_indexclauses((*path).indexclauses);
-            let selectivity_quals = add_predicate_to_index_quals(index_opt_info, index_quals);
-            clauselist_selectivity(
-                root,
-                selectivity_quals,
-                (*(*index_opt_info).rel).relid as _,
-                JoinType::JOIN_INNER,
-                std::ptr::null_mut(),
-            )
+            let baserel = (*index_opt_info).rel;
+            let total_rows = (*baserel).tuples;
+            if total_rows > 0.0 {
+                ((*baserel).rows / total_rows).clamp(1e-9, 1.0)
+            } else {
+                1.0
+            }
         };
         // index exists
         if !(*index_opt_info).hypothetical {
@@ -367,8 +378,18 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 pages += cost.cells[0] as f64;
                 pages
             };
-            let next_count =
-                f64::max(1.0, (*root).limit_tuples) * f64::min(1000.0, 1.0 / selectivity);
+            // `next_count` represents "candidates we expect to process to
+            // surface `limit_tuples` survivors after filter rejection."
+            // The original formula caps `1/selectivity` at 1000, then
+            // multiplies by `limit_tuples`. For LIMIT 500 + selectivity
+            // 1e-6 this produced 500,000 even though the IVF scan visits
+            // at most `node_count` (≈ probes × tuples / cells) candidates
+            // regardless of how many we "theoretically need." Clamp by
+            // `node_count` so the reported AM cost can't exceed the work
+            // the IVF will actually do.
+            let next_count = (f64::max(1.0, (*root).limit_tuples)
+                * f64::min(1000.0, 1.0 / selectivity))
+                .min(node_count);
             *index_startup_cost = 0.001 * node_count;
             *index_total_cost = 0.001 * node_count + next_count;
             *index_selectivity = selectivity;
