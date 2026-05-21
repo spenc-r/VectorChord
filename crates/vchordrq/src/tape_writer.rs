@@ -190,9 +190,19 @@ where
             let elements =
                 padding_pack(chunk.iter().map(|x| rabitq::packing::pack_to_u4(&x.code.1)));
             let mut remain = elements.as_slice();
+            let metadata_attr_count = chunk
+                .iter()
+                .map(|x| x.candidate_metadata.attr_count())
+                .max()
+                .unwrap_or(0);
             loop {
                 let freespace = self.tape.freespace();
-                if FrozenTuple::estimate_size_0(self.prefetch, remain.len()) <= freespace as usize {
+                if FrozenTuple::estimate_size_0_with_metadata(
+                    self.prefetch,
+                    remain.len(),
+                    metadata_attr_count,
+                ) <= freespace as usize
+                {
                     self.tape.tape_put(FrozenTuple::_0 {
                         metadata: [
                             chunk.each_ref().map(|x| x.code.0.dis_u_2),
@@ -204,6 +214,7 @@ where
                         prefetch: fix_good(chunk.each_ref().map(|x| x.prefetch.as_slice())),
                         head: chunk.each_ref().map(|x| x.head),
                         payload: chunk.each_ref().map(|x| Some(x.extra)),
+                        candidate_metadata: chunk.each_ref().map(|x| x.candidate_metadata),
                         elements: remain.to_vec(),
                     });
                     break;

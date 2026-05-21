@@ -1,0 +1,317 @@
+# End-to-end coverage for vchordrq wide-INCLUDE metadata prefilter.
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET max_parallel_workers_per_gather = 0;
+
+statement ok
+SET vchordrq.probes = '';
+
+statement ok
+SET vchordrq.prefilter = on;
+
+statement ok
+CREATE TABLE metadata_prefilter_items (
+  id                       int PRIMARY KEY,
+  feed_id_meta_hash        bigint,
+  status_meta              bigint,
+  visibility_meta          bigint,
+  deleted_meta             bigint,
+  eligibility_flags_meta   bigint,
+  geo_cell_meta            bigint,
+  created_at_bucket_meta   bigint,
+  non_meta                 bigint,
+  v                        vector(3) NOT NULL
+);
+
+statement ok
+INSERT INTO metadata_prefilter_items
+SELECT i,
+       CASE WHEN i % 37 = 0
+            THEN NULL
+            ELSE hashtextextended('feed-' || (i % 5)::text, 0)
+       END,
+       (i % 3)::bigint,
+       (i % 2)::bigint,
+       ((i % 17) = 0)::int::bigint,
+       CASE WHEN i % 4 = 0 THEN 3 ELSE 1 END,
+       (i % 10)::bigint,
+       (i / 10)::bigint,
+       (i % 11)::bigint,
+       ARRAY[
+         (i % 97) / 97.0,
+         (i % 89) / 89.0,
+         (i % 83) / 83.0
+       ]::real[]::vector
+FROM generate_series(1, 200) i;
+
+statement ok
+CREATE INDEX metadata_prefilter_all_idx
+ON metadata_prefilter_items
+USING vchordrq (v vector_l2_ops)
+INCLUDE (
+  feed_id_meta_hash,
+  status_meta,
+  visibility_meta,
+  deleted_meta,
+  eligibility_flags_meta,
+  geo_cell_meta,
+  created_at_bucket_meta
+)
+WITH (options = $$
+residual_quantization = false
+rerank_in_table = false
+[build.internal]
+lists = []
+$$);
+
+statement ok
+CREATE TABLE metadata_prefilter_subset AS
+SELECT * FROM metadata_prefilter_items;
+
+statement ok
+CREATE INDEX metadata_prefilter_subset_idx
+ON metadata_prefilter_subset
+USING vchordrq (v vector_l2_ops)
+INCLUDE (feed_id_meta_hash, status_meta)
+WITH (options = $$
+residual_quantization = false
+rerank_in_table = false
+[build.internal]
+lists = []
+$$);
+
+statement ok
+CREATE TABLE metadata_prefilter_plain AS
+SELECT * FROM metadata_prefilter_items;
+
+statement ok
+CREATE INDEX metadata_prefilter_plain_idx
+ON metadata_prefilter_plain
+USING vchordrq (v vector_l2_ops)
+WITH (options = $$
+residual_quantization = false
+rerank_in_table = false
+[build.internal]
+lists = []
+$$);
+
+statement ok
+ANALYZE metadata_prefilter_items;
+
+statement ok
+ANALYZE metadata_prefilter_subset;
+
+statement ok
+ANALYZE metadata_prefilter_plain;
+
+statement ok
+CREATE OR REPLACE FUNCTION metadata_plan_top_index(query text) RETURNS text
+  LANGUAGE plpgsql AS $$
+DECLARE
+  line text;
+  m    text[];
+BEGIN
+  FOR line IN EXECUTE 'EXPLAIN (FORMAT TEXT, COSTS OFF) ' || query LOOP
+    m := regexp_match(line, 'Index (?:Only )?Scan using (\S+) on ');
+    IF m IS NOT NULL THEN RETURN m[1]; END IF;
+    m := regexp_match(line, 'Bitmap Index Scan on (\S+)');
+    IF m IS NOT NULL THEN RETURN m[1]; END IF;
+  END LOOP;
+  RETURN NULL;
+END $$;
+
+statement ok
+CREATE OR REPLACE FUNCTION metadata_prefilter_ids_from(
+  rel regclass,
+  mode text,
+  active text,
+  where_sql text
+) RETURNS int[]
+  LANGUAGE plpgsql AS $$
+DECLARE
+  result int[];
+BEGIN
+  PERFORM set_config('vchordrq.prefilter', 'on', true);
+  PERFORM set_config('vchordrq.metadata_prefilter', mode, true);
+  PERFORM set_config('vchordrq.metadata_active_columns', active, true);
+  EXECUTE format(
+    'SELECT ARRAY(
+       SELECT id FROM %s
+       WHERE %s
+       ORDER BY v <-> ''[0.25,0.25,0.25]''::vector
+       LIMIT 20
+     )',
+    rel,
+    where_sql
+  )
+  INTO result;
+  RETURN result;
+END $$;
+
+statement ok
+SET vchordrq.metadata_prefilter = reject_only;
+
+statement ok
+SET vchordrq.metadata_active_columns = 'feed,flags,status,deleted,visibility,geo,time';
+
+query T
+SELECT metadata_plan_top_index(
+  'SELECT id FROM metadata_prefilter_items
+   WHERE feed_id_meta_hash = hashtextextended(''feed-2'', 0)
+     AND status_meta = 1
+     AND deleted_meta = 0
+   ORDER BY v <-> ''[0.25,0.25,0.25]''::vector
+   LIMIT 20'
+);
+----
+metadata_prefilter_all_idx
+
+query B
+SELECT metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'off',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$feed_id_meta_hash = hashtextextended('feed-2', 0)
+    AND status_meta = 1
+    AND deleted_meta = 0$$
+) = metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'reject_only',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$feed_id_meta_hash = hashtextextended('feed-2', 0)
+    AND status_meta = 1
+    AND deleted_meta = 0$$
+);
+----
+t
+
+query B
+SELECT metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'off',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$non_meta = 7$$
+) = metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'reject_only',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$non_meta = 7$$
+);
+----
+t
+
+query B
+SELECT coalesce(array_length(metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'reject_only',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$feed_id_meta_hash = -1$$
+), 1), 0) = 0;
+----
+t
+
+query B
+SELECT metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'off',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$feed_id_meta_hash IS NULL$$
+) = metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'reject_only',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$feed_id_meta_hash IS NULL$$
+);
+----
+t
+
+query B
+SELECT metadata_prefilter_ids_from(
+  'metadata_prefilter_subset',
+  'off',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$geo_cell_meta = 3 AND status_meta = 1$$
+) = metadata_prefilter_ids_from(
+  'metadata_prefilter_subset',
+  'reject_only',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$geo_cell_meta = 3 AND status_meta = 1$$
+);
+----
+t
+
+query B
+SELECT metadata_prefilter_ids_from(
+  'metadata_prefilter_plain',
+  'off',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$feed_id_meta_hash = hashtextextended('feed-4', 0) AND status_meta = 2$$
+) = metadata_prefilter_ids_from(
+  'metadata_prefilter_plain',
+  'reject_only',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$feed_id_meta_hash = hashtextextended('feed-4', 0) AND status_meta = 2$$
+);
+----
+t
+
+query B
+SELECT metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'off',
+  'feed,bogus,geo',
+  $$feed_id_meta_hash = hashtextextended('feed-1', 0)
+    AND geo_cell_meta = 6
+    AND status_meta = 0$$
+) = metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'reject_only',
+  'feed,bogus,geo',
+  $$feed_id_meta_hash = hashtextextended('feed-1', 0)
+    AND geo_cell_meta = 6
+    AND status_meta = 0$$
+);
+----
+t
+
+statement ok
+SET vchordrq.metadata_prefilter_debug = on;
+
+query B
+SELECT metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'reject_only',
+  'feed,status,deleted',
+  $$feed_id_meta_hash = hashtextextended('feed-3', 0)
+    AND status_meta = 2
+    AND deleted_meta = 0$$
+) IS NOT NULL;
+----
+t
+
+statement ok
+SET vchordrq.metadata_prefilter_debug = off;
+
+statement error
+SHOW vchordrq.vector_read_window;
+
+statement error
+SHOW vchordrq.prefilter_window;
+
+statement error
+SHOW vchordrq.read_stream_batch;
+
+statement error
+SHOW vchordrq.instrument_timing;
+
+statement ok
+DROP FUNCTION metadata_prefilter_ids_from(regclass, text, text, text);
+
+statement ok
+DROP FUNCTION metadata_plan_top_index(text);
+
+statement ok
+DROP TABLE metadata_prefilter_items, metadata_prefilter_subset, metadata_prefilter_plain;

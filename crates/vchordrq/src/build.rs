@@ -105,6 +105,7 @@ pub fn build<R: RelationWrite, O: Operator>(
                         head: pointer_of_centroids[i - 1][child as usize].1,
                         extra: pointer_of_firsts[i - 1][child as usize],
                         norm: norm::<O::Vector>(vector),
+                        candidate_metadata: crate::CandidateMetadata::default(),
                     });
                 }
                 let (mut tape, chunk) = tape.into_inner();

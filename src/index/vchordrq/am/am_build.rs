@@ -38,6 +38,8 @@ use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
 use vector::vect::VectOwned;
 
+use super::metadata;
+
 #[derive(Debug, Clone, Copy)]
 #[repr(u16)]
 pub enum BuildPhaseCode {
@@ -953,6 +955,7 @@ unsafe fn parallel_build(
 
     let scan = unsafe { pgrx::pg_sys::table_beginscan_parallel(heap_relation, tablescandesc) };
     let opfamily = unsafe { opfamily(index_relation) };
+    let metadata_schema = unsafe { metadata::detect_schema(index_relation) };
     let traverser = unsafe { HeapTraverser::new(heap_relation, index_relation, index_info, scan) };
 
     struct IdChooser(u32);
@@ -986,6 +989,9 @@ unsafe fn parallel_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let candidate_metadata = unsafe {
+                    metadata::metadata_from_index_values(values, is_nulls, &metadata_schema)
+                };
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
@@ -998,6 +1004,7 @@ unsafe fn parallel_build(
                         opfamily,
                         &index,
                         payload,
+                        candidate_metadata,
                         vector,
                         true,
                         true,
@@ -1026,6 +1033,9 @@ unsafe fn parallel_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let candidate_metadata = unsafe {
+                    metadata::metadata_from_index_values(values, is_nulls, &metadata_schema)
+                };
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
@@ -1038,6 +1048,7 @@ unsafe fn parallel_build(
                         opfamily,
                         &index,
                         payload,
+                        candidate_metadata,
                         vector,
                         true,
                         true,
@@ -1093,6 +1104,7 @@ unsafe fn sequential_build(
     let cached = VchordrqCachedReader::deserialize_ref(vchordrqcached);
 
     let opfamily = unsafe { opfamily(index_relation) };
+    let metadata_schema = unsafe { metadata::detect_schema(index_relation) };
     let traverser = unsafe {
         HeapTraverser::new(
             heap_relation,
@@ -1131,6 +1143,9 @@ unsafe fn sequential_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let candidate_metadata = unsafe {
+                    metadata::metadata_from_index_values(values, is_nulls, &metadata_schema)
+                };
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
@@ -1143,6 +1158,7 @@ unsafe fn sequential_build(
                         opfamily,
                         &index,
                         payload,
+                        candidate_metadata,
                         vector,
                         true,
                         true,
@@ -1163,6 +1179,9 @@ unsafe fn sequential_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let candidate_metadata = unsafe {
+                    metadata::metadata_from_index_values(values, is_nulls, &metadata_schema)
+                };
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
@@ -1175,6 +1194,7 @@ unsafe fn sequential_build(
                         opfamily,
                         &index,
                         payload,
+                        candidate_metadata,
                         vector,
                         true,
                         true,
@@ -1227,8 +1247,8 @@ unsafe fn options(
     if atts.is_empty() {
         pgrx::error!("indexing on no columns is not supported");
     }
-    if atts.len() != 1 {
-        pgrx::error!("multicolumn index is not supported");
+    unsafe {
+        metadata::detect_schema(index_relation);
     }
     // get dim
     let typmod = Typmod::new(atts[0].atttypmod).unwrap();

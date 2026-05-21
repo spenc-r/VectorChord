@@ -12,7 +12,7 @@
 //
 // Copyright (c) 2025-2026 TensorChord Inc.
 
-use crate::packed::PackedRefMut;
+use crate::packed::{PackedRefMut, PackedRefMut4};
 use always_equal::AlwaysEqual;
 
 pub type BorrowedIter<'b> = small_iter::borrowed::Iter<'b, u32, 1>;
@@ -38,6 +38,20 @@ impl<'b, T, A, B, W: 'b + PackedRefMut<T = (A, B, BorrowedIter<'b>)>> Fetch<'b>
     #[inline(always)]
     fn fetch(&self) -> BorrowedIter<'b> {
         let (.., list) = self.1.0.get();
+        *list
+    }
+}
+
+impl<'b, T, A, B, C> Fetch<'b>
+    for (
+        T,
+        AlwaysEqual<PackedRefMut4<'b, (A, B, C, BorrowedIter<'b>)>>,
+    )
+{
+    type Iter = BorrowedIter<'b>;
+    #[inline(always)]
+    fn fetch(&self) -> BorrowedIter<'b> {
+        let (_, _, _, list) = self.1.0.get();
         *list
     }
 }

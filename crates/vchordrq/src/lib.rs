@@ -44,8 +44,14 @@ pub use fast_heap::FastHeap;
 pub use insert::{InsertChooser, insert, insert_vector};
 pub use maintain::{MaintainChooser, maintain};
 pub use prewarm::prewarm;
-pub use rerank::{how, rerank_heap, rerank_index};
-pub use search::{default_search, maxsim_search};
+pub use rerank::{
+    RerankInstrumentation, RerankInstrumentationSnapshot, how, rerank_heap,
+    rerank_heap_instrumented, rerank_index, rerank_index_instrumented,
+};
+pub use search::{
+    BlockPrune, DefaultSearchStats, default_search, default_search_with_candidate_filter,
+    default_search_with_candidate_filter_and_block_prune, maxsim_search,
+};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -66,10 +72,60 @@ pub(crate) struct Branch<T> {
     pub head: u16,
     pub norm: f32,
     pub extra: T,
+    pub candidate_metadata: CandidateMetadata,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum RerankMethod {
     Index,
     Heap,
+}
+
+pub const MAX_METADATA_ATTRS: usize = 32;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CandidateMetadata {
+    valid: u32,
+    values: [i64; MAX_METADATA_ATTRS],
+}
+
+impl Default for CandidateMetadata {
+    fn default() -> Self {
+        Self {
+            valid: 0,
+            values: [0; MAX_METADATA_ATTRS],
+        }
+    }
+}
+
+impl CandidateMetadata {
+    pub fn get(self, index: usize) -> Option<i64> {
+        if index >= MAX_METADATA_ATTRS || self.valid & (1_u32 << index) == 0 {
+            None
+        } else {
+            Some(self.values[index])
+        }
+    }
+
+    pub fn set(&mut self, index: usize, value: i64) {
+        assert!(index < MAX_METADATA_ATTRS);
+        self.valid |= 1_u32 << index;
+        self.values[index] = value;
+    }
+
+    pub fn valid(self) -> u32 {
+        self.valid
+    }
+
+    pub fn attr_count(self) -> usize {
+        if self.valid == 0 {
+            0
+        } else {
+            (u32::BITS - self.valid.leading_zeros()) as usize
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.valid == 0
+    }
 }

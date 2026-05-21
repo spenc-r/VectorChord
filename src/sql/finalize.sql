@@ -282,7 +282,7 @@ BEGIN
                 A.amname = 'vchordrq'
                 AND AO.amopstrategy = 1
                 AND C.relkind = 'r'
-                AND X.indnatts = 1
+                AND X.indnkeyatts = 1
                 AND X.indexrelid = %1$s
         )
         SELECT

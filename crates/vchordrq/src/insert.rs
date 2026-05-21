@@ -70,6 +70,7 @@ where
 pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     index: &'b R,
     payload: NonZero<u64>,
+    candidate_metadata: crate::CandidateMetadata,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     key: (Vec<u32>, u16),
     bump: &'b impl Bump,
@@ -197,6 +198,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         ],
         delta,
         payload: Some(payload),
+        candidate_metadata,
         prefetch,
         head,
         elements: rabitq::bit::binary::pack_code(&code.1),
