@@ -43,8 +43,24 @@ ORDER BY v <-> ('[' || array_to_string(array_fill(0.13::real, ARRAY[{VECTOR_DIM}
 LIMIT 50
 """
 
-
 DEBUG_NOTICE_PREFIX = "vchordrq_metadata_prefilter "
+
+
+def assert_vchord_plan(cur: psycopg.Cursor) -> None:
+    cur.execute("SET enable_seqscan = off")
+    cur.execute("SET enable_sort = on")
+    cur.execute("SET vchordrq.prefilter = on")
+    cur.execute("SET vchordrq.metadata_prefilter = 'reject_only'")
+    cur.execute(
+        "SET vchordrq.metadata_active_columns = "
+        "'feed,flags,status,deleted,visibility,geo,time'"
+    )
+    cur.execute(f"EXPLAIN (FORMAT TEXT, COSTS OFF) {QUERY}")
+    plan = "\n".join(row[0] for row in cur.fetchall())
+    if "metadata_prefilter_smoke_idx" not in plan:
+        raise AssertionError(
+            "planner did not choose vchordrq metadata index with sort enabled:\n" + plan
+        )
 
 
 def run_timed(
@@ -149,6 +165,13 @@ def main() -> None:
                 """
             )
             cur.execute("ANALYZE metadata_prefilter_smoke")
+            cur.execute(
+                "CREATE INDEX metadata_prefilter_smoke_filter_idx "
+                "ON metadata_prefilter_smoke (feed_id_meta_hash, status_meta, deleted_meta)"
+            )
+            cur.execute("ANALYZE metadata_prefilter_smoke")
+
+            assert_vchord_plan(cur)
 
             off_result, off_s = run_timed(cur, "off", False, args.repeats, notices)
             if any(n.startswith(DEBUG_NOTICE_PREFIX) for n in notices):

@@ -15,6 +15,7 @@
 use pgrx::pg_sys;
 use std::collections::BTreeSet;
 use std::ffi::CStr;
+use std::ptr;
 use std::ptr::NonNull;
 
 use super::metadata::{MetadataColumnKind, MetadataSchema};
@@ -124,6 +125,12 @@ impl MetadataActiveColumns {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PlannerMetadataCost {
+    pub selectivity: f64,
+    pub supported_qual_count: usize,
+}
+
 #[derive(Default)]
 struct QualDiagnostics {
     supported_qual_count: usize,
@@ -178,6 +185,56 @@ pub unsafe fn compile_scan_qual(
         return CompiledMetadataQual::default();
     };
     diagnostics.compiled()
+}
+
+pub unsafe fn planner_metadata_cost(
+    root: *mut pg_sys::PlannerInfo,
+    path: *mut pg_sys::IndexPath,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+) -> Option<PlannerMetadataCost> {
+    unsafe {
+        if root.is_null() || path.is_null() || schema.cols() == 0 {
+            return None;
+        }
+        let index_info = (*path).indexinfo;
+        if index_info.is_null() {
+            return None;
+        }
+        let qual_list = (*index_info).indrestrictinfo;
+        let mut metadata_quals = ptr::null_mut();
+        let mut supported_qual_count = 0_usize;
+        for_each_list_node(qual_list, |node| {
+            if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_RestrictInfo {
+                return;
+            }
+            let rinfo = node.cast::<pg_sys::RestrictInfo>();
+            let clause = (*rinfo).clause.cast::<pg_sys::Node>();
+            if planner_qual_is_coverable(clause, index_info, schema, active) {
+                supported_qual_count += 1;
+                metadata_quals = pg_sys::lappend(metadata_quals, rinfo.cast());
+            }
+        });
+        if supported_qual_count == 0 || metadata_quals.is_null() {
+            return None;
+        }
+        let var_relid = if (*index_info).rel.is_null() {
+            0
+        } else {
+            (*(*index_info).rel).relid as i32
+        };
+        let selectivity = pg_sys::clauselist_selectivity(
+            root,
+            metadata_quals,
+            var_relid,
+            pg_sys::JoinType::JOIN_INNER,
+            ptr::null_mut(),
+        );
+        Some(PlannerMetadataCost {
+            selectivity,
+            supported_qual_count,
+        })
+    }
 }
 
 pub unsafe fn log_scan_qual_diagnostics(
@@ -472,6 +529,177 @@ fn record_detected(
     }
     diagnostics.record_supported(detected.predicate, detected.description);
     true
+}
+
+unsafe fn planner_qual_is_coverable(
+    node: *mut pg_sys::Node,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+) -> bool {
+    unsafe {
+        let node = strip_relabel(node);
+        if node.is_null() {
+            return false;
+        }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_BoolExpr => {
+                let expr = node.cast::<pg_sys::BoolExpr>();
+                if (*expr).boolop != pg_sys::BoolExprType::AND_EXPR {
+                    return false;
+                }
+                let args = list_nodes((*expr).args);
+                !args.is_empty()
+                    && args
+                        .into_iter()
+                        .all(|child| planner_qual_is_coverable(child, index_info, schema, active))
+            }
+            pg_sys::NodeTag::T_OpExpr => {
+                planner_op_expr_is_coverable(node.cast(), index_info, schema, active)
+            }
+            pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+                planner_scalar_array_expr_is_coverable(node.cast(), index_info, schema, active)
+            }
+            _ => false,
+        }
+    }
+}
+
+unsafe fn planner_op_expr_is_coverable(
+    expr: *mut pg_sys::OpExpr,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+) -> bool {
+    unsafe {
+        let args = list_nodes((*expr).args);
+        if args.len() != 2 {
+            return false;
+        }
+        planner_bitmask_contains_is_coverable(expr, args[0], args[1], index_info, schema, active)
+            || planner_binary_predicate_is_coverable(
+                expr, args[0], args[1], index_info, schema, active,
+            )
+            || planner_binary_predicate_is_coverable(
+                expr, args[1], args[0], index_info, schema, active,
+            )
+    }
+}
+
+unsafe fn planner_scalar_array_expr_is_coverable(
+    expr: *mut pg_sys::ScalarArrayOpExpr,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+) -> bool {
+    unsafe {
+        if !(*expr).useOr || !is_int8_equality_func((*expr).opfuncid) {
+            return false;
+        }
+        let args = list_nodes((*expr).args);
+        if args.len() != 2 {
+            return false;
+        }
+        let Some(var) = planner_metadata_var(args[0], index_info, schema) else {
+            return false;
+        };
+        if var.vartype != pg_sys::INT8OID || !active.contains(var.kind) {
+            return false;
+        }
+        array_values_for_node(args[1], ptr::null_mut(), &var.name)
+            .map(|values| values.supported)
+            .unwrap_or(false)
+    }
+}
+
+unsafe fn planner_binary_predicate_is_coverable(
+    expr: *mut pg_sys::OpExpr,
+    var_node: *mut pg_sys::Node,
+    value_node: *mut pg_sys::Node,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+) -> bool {
+    unsafe {
+        let Some(var) = planner_metadata_var(var_node, index_info, schema) else {
+            return false;
+        };
+        if var.vartype != pg_sys::INT8OID
+            || !active.contains(var.kind)
+            || int8_binary_op(expr).is_none()
+        {
+            return false;
+        }
+        scalar_value_for_node(value_node, ptr::null_mut(), &var.name)
+            .map(|value| value.supported)
+            .unwrap_or(false)
+    }
+}
+
+unsafe fn planner_bitmask_contains_is_coverable(
+    expr: *mut pg_sys::OpExpr,
+    left: *mut pg_sys::Node,
+    right: *mut pg_sys::Node,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+) -> bool {
+    unsafe {
+        if int8_binary_op(expr) != Some(Int8BinaryOp::Eq) {
+            return false;
+        }
+        let Some((var, mask)) = planner_int8_and(left, index_info, schema) else {
+            return false;
+        };
+        if !active.contains(var.kind) {
+            return false;
+        }
+        let Some(expected) = scalar_value_for_node(right, ptr::null_mut(), &var.name) else {
+            return false;
+        };
+        expected.supported && expected.value == Some(mask)
+    }
+}
+
+unsafe fn planner_int8_and(
+    node: *mut pg_sys::Node,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+) -> Option<(MetadataVar, i64)> {
+    unsafe {
+        let node = strip_relabel(node);
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_OpExpr {
+            return None;
+        }
+        let expr = node.cast::<pg_sys::OpExpr>();
+        if !is_int8_and_operator(expr) {
+            return None;
+        }
+        let args = list_nodes((*expr).args);
+        if args.len() != 2 {
+            return None;
+        }
+        planner_int8_and_operands(args[0], args[1], index_info, schema)
+            .or_else(|| planner_int8_and_operands(args[1], args[0], index_info, schema))
+    }
+}
+
+unsafe fn planner_int8_and_operands(
+    var_node: *mut pg_sys::Node,
+    value_node: *mut pg_sys::Node,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+) -> Option<(MetadataVar, i64)> {
+    let var = unsafe { planner_metadata_var(var_node, index_info, schema)? };
+    if var.vartype != pg_sys::INT8OID {
+        return None;
+    }
+    let mask = unsafe { scalar_value_for_node(value_node, ptr::null_mut(), &var.name)? };
+    if mask.supported {
+        Some((var, mask.value?))
+    } else {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -858,8 +1086,8 @@ unsafe fn int8_array_values(datum: pg_sys::Datum) -> Vec<i64> {
         let mut typbyval = false;
         let mut typalign = 0;
         pg_sys::get_typlenbyvalalign(pg_sys::INT8OID, &mut typlen, &mut typbyval, &mut typalign);
-        let mut elements: *mut pg_sys::Datum = std::ptr::null_mut();
-        let mut nulls: *mut bool = std::ptr::null_mut();
+        let mut elements: *mut pg_sys::Datum = ptr::null_mut();
+        let mut nulls: *mut bool = ptr::null_mut();
         let mut nelems = 0;
         pg_sys::deconstruct_array(
             datum.cast_mut_ptr::<pg_sys::ArrayType>(),
@@ -924,6 +1152,45 @@ unsafe fn metadata_var(
             metadata_index: column.metadata_index,
             vartype: var.vartype,
         })
+    }
+}
+
+unsafe fn planner_metadata_var(
+    node: *mut pg_sys::Node,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+) -> Option<MetadataVar> {
+    unsafe {
+        let node = strip_relabel(node);
+        if node.is_null()
+            || index_info.is_null()
+            || (*index_info).indexkeys.is_null()
+            || (*node).type_ != pg_sys::NodeTag::T_Var
+        {
+            return None;
+        }
+        let var = *node.cast::<pg_sys::Var>();
+        if !(*index_info).rel.is_null() && var.varno != (*(*index_info).rel).relid as i32 {
+            return None;
+        }
+        for column in schema.columns() {
+            if column.index_attno >= (*index_info).ncolumns as usize {
+                continue;
+            }
+            let heap_attno = (*index_info).indexkeys.add(column.index_attno).read();
+            if heap_attno <= 0 {
+                continue;
+            }
+            if var.varattno as i32 == heap_attno || var.varattnosyn as i32 == heap_attno {
+                return Some(MetadataVar {
+                    name: column.name.clone(),
+                    kind: column.kind,
+                    metadata_index: column.metadata_index,
+                    vartype: var.vartype,
+                });
+            }
+        }
+        None
     }
 }
 

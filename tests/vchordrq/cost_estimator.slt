@@ -103,6 +103,24 @@ BEGIN
   RETURN NULL;
 END $$;
 
+statement ok
+CREATE OR REPLACE FUNCTION metadata_cost_with_settings(
+  mode text,
+  active_columns text,
+  query text
+) RETURNS double precision
+  LANGUAGE plpgsql AS $$
+DECLARE
+  result double precision;
+BEGIN
+  PERFORM set_config('vchordrq.prefilter', 'on', true);
+  PERFORM set_config('vchordrq.metadata_prefilter', mode, true);
+  PERFORM set_config('vchordrq.metadata_active_columns', active_columns, true);
+  PERFORM set_config('vchordrq.metadata_prefilter_debug', 'off', true);
+  SELECT top_total_cost(query) INTO result;
+  RETURN result;
+END $$;
+
 # Helper: returns total cost for the first plan node matching `pat`.
 statement ok
 CREATE OR REPLACE FUNCTION plan_node_total_cost(query text, pat text) RETURNS double precision
@@ -389,6 +407,232 @@ statement ok
 RESET enable_seqscan;
 
 # ---------------------------------------------------------------------------
+# Case 12: metadata INCLUDE predicates should lower vchord's estimated heap
+# work. With metadata prefiltering enabled, vchord wins against a bitmap+sort
+# path over competing btree metadata indexes without disabling sort.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE cost_test_metadata (
+  id                       int PRIMARY KEY,
+  feed_id_meta_hash        bigint,
+  status_meta              bigint,
+  deleted_meta             bigint,
+  geo_cell_meta            bigint,
+  v                        vector(3) NOT NULL
+);
+
+statement ok
+INSERT INTO cost_test_metadata
+SELECT i,
+       CASE WHEN i % 997 = 0
+            THEN NULL
+            ELSE hashtextextended('feed-' || (i % 100)::text, 0)
+       END,
+       (i % 5)::bigint,
+       ((i % 97) = 0)::int::bigint,
+       (i % 256)::bigint,
+       ARRAY[
+         (i % 997) / 997.0,
+         (i % 991) / 991.0,
+         (i % 983) / 983.0
+       ]::real[]::vector
+FROM generate_series(1, 50000) i;
+
+statement ok
+CREATE INDEX cost_test_metadata_v ON cost_test_metadata
+USING vchordrq (v vector_l2_ops)
+INCLUDE (feed_id_meta_hash, status_meta, deleted_meta, geo_cell_meta)
+WITH (options = $$
+residual_quantization = false
+rerank_in_table = false
+[build.internal]
+lists = []
+$$);
+
+statement ok
+ANALYZE cost_test_metadata;
+
+statement ok
+SET enable_seqscan = off;
+
+query B
+SELECT metadata_cost_with_settings(
+  'reject_only',
+  'feed,status,deleted',
+  'SELECT id FROM cost_test_metadata
+   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
+     AND status_meta = 2
+     AND deleted_meta = 0
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+) < metadata_cost_with_settings(
+  'off',
+  'feed,status,deleted',
+  'SELECT id FROM cost_test_metadata
+   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
+     AND status_meta = 2
+     AND deleted_meta = 0
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+);
+----
+t
+
+query B
+SELECT abs(metadata_cost_with_settings(
+  'reject_only',
+  '',
+  'SELECT id FROM cost_test_metadata
+   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
+     AND status_meta = 2
+     AND deleted_meta = 0
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+) - metadata_cost_with_settings(
+  'off',
+  'feed,status,deleted',
+  'SELECT id FROM cost_test_metadata
+   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
+     AND status_meta = 2
+     AND deleted_meta = 0
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+)) < 0.01;
+----
+t
+
+query B
+SELECT abs(metadata_cost_with_settings(
+  'reject_only',
+  'feed,status,deleted',
+  'SELECT id FROM cost_test_metadata
+   WHERE feed_id_meta_hash IS NULL
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+) - metadata_cost_with_settings(
+  'off',
+  'feed,status,deleted',
+  'SELECT id FROM cost_test_metadata
+   WHERE feed_id_meta_hash IS NULL
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+)) < 0.01;
+----
+t
+
+statement ok
+CREATE INDEX cost_test_metadata_filter ON cost_test_metadata
+  (feed_id_meta_hash, status_meta, deleted_meta);
+
+statement ok
+ANALYZE cost_test_metadata;
+
+statement ok
+SET enable_sort = on;
+
+statement ok
+SET enable_seqscan = on;
+
+statement ok
+SET vchordrq.prefilter = on;
+
+statement ok
+SET vchordrq.metadata_active_columns = 'feed,status,deleted';
+
+statement ok
+SET vchordrq.metadata_prefilter = reject_only;
+
+query T
+SELECT plan_top_index(
+  'SELECT id FROM cost_test_metadata
+   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
+     AND status_meta = 2
+     AND deleted_meta = 0
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+);
+----
+cost_test_metadata_v
+
+statement ok
+SET vchordrq.metadata_prefilter = off;
+
+query B
+SELECT plan_top_index(
+  'SELECT id FROM cost_test_metadata
+   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
+     AND status_meta = 2
+     AND deleted_meta = 0
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+) IS DISTINCT FROM 'cost_test_metadata_v';
+----
+t
+
+# ---------------------------------------------------------------------------
+# Case 13: no INCLUDE metadata means reject_only is cost-neutral.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE cost_test_metadata_plain AS
+SELECT * FROM cost_test_metadata;
+
+statement ok
+CREATE INDEX cost_test_metadata_plain_v ON cost_test_metadata_plain
+USING vchordrq (v vector_l2_ops)
+WITH (options = $$
+residual_quantization = false
+rerank_in_table = false
+[build.internal]
+lists = []
+$$);
+
+statement ok
+ANALYZE cost_test_metadata_plain;
+
+statement ok
+SET enable_seqscan = off;
+
+query B
+SELECT abs(metadata_cost_with_settings(
+  'reject_only',
+  'feed,status,deleted',
+  'SELECT id FROM cost_test_metadata_plain
+   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
+     AND status_meta = 2
+     AND deleted_meta = 0
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+) - metadata_cost_with_settings(
+  'off',
+  'feed,status,deleted',
+  'SELECT id FROM cost_test_metadata_plain
+   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
+     AND status_meta = 2
+     AND deleted_meta = 0
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+)) < 0.01;
+----
+t
+
+statement ok
+RESET enable_sort;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET vchordrq.prefilter;
+
+statement ok
+RESET vchordrq.metadata_prefilter;
+
+statement ok
+RESET vchordrq.metadata_active_columns;
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 
@@ -405,6 +649,12 @@ statement ok
 DROP TABLE cost_test_partial;
 
 statement ok
+DROP TABLE cost_test_metadata;
+
+statement ok
+DROP TABLE cost_test_metadata_plain;
+
+statement ok
 DROP FUNCTION slow_true(int);
 
 statement ok
@@ -415,6 +665,9 @@ DROP FUNCTION plan_node_total_cost(text, text);
 
 statement ok
 DROP FUNCTION top_total_cost(text);
+
+statement ok
+DROP FUNCTION metadata_cost_with_settings(text, text, text);
 
 statement ok
 RESET enable_seqscan;
