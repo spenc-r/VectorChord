@@ -1086,8 +1086,8 @@ unsafe fn int8_array_values(datum: pg_sys::Datum) -> Vec<i64> {
         let mut typbyval = false;
         let mut typalign = 0;
         pg_sys::get_typlenbyvalalign(pg_sys::INT8OID, &mut typlen, &mut typbyval, &mut typalign);
-        let mut elements: *mut pg_sys::Datum = std::ptr::null_mut();
-        let mut nulls: *mut bool = std::ptr::null_mut();
+        let mut elements: *mut pg_sys::Datum = ptr::null_mut();
+        let mut nulls: *mut bool = ptr::null_mut();
         let mut nelems = 0;
         pg_sys::deconstruct_array(
             datum.cast_mut_ptr::<pg_sys::ArrayType>(),
@@ -1170,7 +1170,7 @@ unsafe fn planner_metadata_var(
             return None;
         }
         let var = *node.cast::<pg_sys::Var>();
-        if !(*index_info).rel.is_null() && var.varno != (*(*index_info).rel).relid {
+        if !(*index_info).rel.is_null() && var.varno != (*(*index_info).rel).relid as i32 {
             return None;
         }
         for column in schema.columns() {
