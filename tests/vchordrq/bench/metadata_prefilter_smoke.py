@@ -4,6 +4,20 @@
 This is intentionally small enough for ad hoc regression checks. It expects a
 database with the vchord extension installed and the Python `psycopg` package
 available.
+
+Shape notes (do not casually change):
+
+* `VECTOR_DIM = 128`. The metadata prefilter saves wall-clock by skipping
+  vector arithmetic on rejected candidates inside the vchord scan. At
+  `vector(3)` the distance compute is trivially cheap, so even when the index
+  is used the speedup degrades to ~1.2x and gets lost in noise.
+
+* `SET enable_seqscan = off` in `run_timed`. On a 100k-row synthetic table the
+  cost-fix branch's planner correctly prices Seq Scan as cheaper than the
+  vchord index scan, which would bypass the feature under test entirely (both
+  modes execute the same Seq Scan plan and produce 1.0x "speedup"). Forcing
+  the index is the supported way to exercise the metadata-prefilter code
+  path in a regression test.
 """
 
 from __future__ import annotations
@@ -16,18 +30,21 @@ import time
 import psycopg
 
 
-QUERY = """
+VECTOR_DIM = 128
+
+QUERY = f"""
 SELECT id
 FROM metadata_prefilter_smoke
 WHERE feed_id_meta_hash = hashtextextended('feed-10', 0)
   AND status_meta = 0
   AND deleted_meta = 0
-ORDER BY v <-> '[0.13,0.21,0.34]'::vector
+ORDER BY v <-> ('[' || array_to_string(array_fill(0.13::real, ARRAY[{VECTOR_DIM}]), ',') || ']')::vector
 LIMIT 50
 """
 
 
 def run_timed(cur: psycopg.Cursor, mode: str, debug: bool, repeats: int) -> tuple[list[int], float]:
+    cur.execute("SET enable_seqscan = off")
     cur.execute("SET vchordrq.prefilter = on")
     cur.execute(f"SET vchordrq.metadata_prefilter = {mode}")
     cur.execute(
@@ -60,7 +77,7 @@ def main() -> None:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vchord")
             cur.execute("DROP TABLE IF EXISTS metadata_prefilter_smoke")
             cur.execute(
-                """
+                f"""
                 CREATE TABLE metadata_prefilter_smoke (
                   id int PRIMARY KEY,
                   feed_id_meta_hash bigint,
@@ -70,12 +87,12 @@ def main() -> None:
                   eligibility_flags_meta bigint,
                   geo_cell_meta bigint,
                   created_at_bucket_meta bigint,
-                  v vector(3) NOT NULL
+                  v vector({VECTOR_DIM}) NOT NULL
                 )
                 """
             )
             cur.execute(
-                """
+                f"""
                 INSERT INTO metadata_prefilter_smoke
                 SELECT i,
                        hashtextextended('feed-' || (i %% 100)::text, 0),
@@ -85,11 +102,12 @@ def main() -> None:
                        CASE WHEN i %% 8 = 0 THEN 7 ELSE 3 END,
                        (i %% 512)::bigint,
                        (i / 256)::bigint,
-                       ARRAY[
-                         (i %% 997) / 997.0,
-                         (i %% 991) / 991.0,
-                         (i %% 983) / 983.0
-                       ]::real[]::vector
+                       (
+                         SELECT array_agg(
+                           ((i::bigint * 1103515245 + j::bigint * 12345) %% 65536)::real / 65536.0
+                         )::real[]::vector
+                         FROM generate_series(1, {VECTOR_DIM}) j
+                       )
                 FROM generate_series(1, %s) i
                 """,
                 (args.rows,),
