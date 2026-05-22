@@ -280,6 +280,7 @@ t
 statement ok
 SET vchordrq.metadata_prefilter_debug = on;
 
+# debug=on must not change the result set (per-scan instrumentation only).
 query B
 SELECT metadata_prefilter_ids_from(
   'metadata_prefilter_items',
@@ -287,6 +288,70 @@ SELECT metadata_prefilter_ids_from(
   'feed,status,deleted',
   $$feed_id_meta_hash = hashtextextended('feed-3', 0)
     AND status_meta = 2
+    AND deleted_meta = 0$$
+) = metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'off',
+  'feed,status,deleted',
+  $$feed_id_meta_hash = hashtextextended('feed-3', 0)
+    AND status_meta = 2
+    AND deleted_meta = 0$$
+);
+----
+t
+
+# debug=on with metadata_prefilter=off must still produce correct results.
+# (The scanner allocates instrumentation, but metadata_candidate_allows
+# short-circuits without checks.)
+query B
+SELECT metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'off',
+  'feed,status,deleted',
+  $$feed_id_meta_hash = hashtextextended('feed-1', 0)
+    AND status_meta = 0$$
+) = metadata_prefilter_ids_from(
+  'metadata_prefilter_plain',
+  'off',
+  'feed,status,deleted',
+  $$feed_id_meta_hash = hashtextextended('feed-1', 0)
+    AND status_meta = 0$$
+);
+----
+t
+
+# debug=on with a predicate the prefilter can't cover (only non-meta columns)
+# must not error and must match the off-mode result set.
+query B
+SELECT metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'reject_only',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$non_meta = 3$$
+) = metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'off',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$non_meta = 3$$
+);
+----
+t
+
+# Toggling the GUC off then on within a session must work (the scanner
+# re-reads the GUC on every rescan).
+statement ok
+SET vchordrq.metadata_prefilter_debug = off;
+
+statement ok
+SET vchordrq.metadata_prefilter_debug = on;
+
+query B
+SELECT metadata_prefilter_ids_from(
+  'metadata_prefilter_items',
+  'reject_only',
+  'feed,flags,status,deleted,visibility,geo,time',
+  $$feed_id_meta_hash = hashtextextended('feed-2', 0)
+    AND status_meta = 1
     AND deleted_meta = 0$$
 ) IS NOT NULL;
 ----

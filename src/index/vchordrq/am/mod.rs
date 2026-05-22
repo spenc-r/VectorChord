@@ -591,7 +591,13 @@ pub unsafe extern "C-unwind" fn amrescan(
             block_prune: gucs::vchordrq_metadata_block_prune(),
             debug: gucs::vchordrq_metadata_prefilter_debug(),
         };
-        let instrumentation: Option<SearchInstrumentation> = None;
+        // metadata_prefilter_debug serves two purposes (see scanners/default.rs::
+        // metadata_candidate_allows): (a) sample-verify every rejected candidate
+        // against the heap recheck and ERROR on a false negative; (b) collect
+        // per-scan counters that finish_instrumentation emits as a NOTICE. We
+        // only allocate the SearchInstrumentation when (b) is requested.
+        let instrumentation: Option<SearchInstrumentation> =
+            gucs::vchordrq_metadata_prefilter_debug().then(SearchInstrumentation::new);
         if let Some(instrumentation) = &instrumentation {
             instrumentation.set_metadata_qual_stats(
                 compiled_metadata_qual.supported_qual_count,
@@ -609,9 +615,6 @@ pub unsafe extern "C-unwind" fn amrescan(
                 io_search: io_search.as_guc_name(),
                 io_rerank: io_rerank.as_guc_name(),
                 prefilter,
-                read_stream_batch,
-                prefilter_window,
-                vector_read_window,
                 metadata_prefilter_mode: metadata_prefilter.mode.as_guc_name(),
                 metadata_schema_cols: metadata_prefilter.schema_cols,
                 metadata_block_prune: metadata_prefilter.block_prune,
@@ -791,9 +794,6 @@ struct InstrumentationLogContext {
     io_search: &'static str,
     io_rerank: &'static str,
     prefilter: bool,
-    read_stream_batch: bool,
-    prefilter_window: usize,
-    vector_read_window: usize,
     metadata_prefilter_mode: &'static str,
     metadata_schema_cols: usize,
     metadata_block_prune: bool,
@@ -810,28 +810,41 @@ impl Scanner {
             return;
         }
         let snapshot = instrumentation.snapshot();
-        pgrx::log!(
-            "vchordrq_scan_timing opfamily={} probes={} epsilon={} io_search={} io_rerank={} prefilter={} read_stream_batch={} prefilter_window={} vector_read_window={} metadata_prefilter_mode={} metadata_schema_cols={} metadata_block_prune={} candidate_count={} candidate_count_before_block_prune={} candidate_count_after_block_prune={} scored_count={} emitted_count={} prefilter_checked_count={} prefilter_passed_count={} index_vector_pages={} metadata_checked_count={} metadata_rejected_count={} metadata_survived_count={} metadata_true_count={} metadata_maybe_count={} metadata_rejected_by_feed_count={} metadata_rejected_by_flags_count={} metadata_rejected_by_status_count={} metadata_rejected_by_deleted_count={} metadata_rejected_by_visibility_count={} metadata_rejected_by_geo_count={} metadata_rejected_by_time_count={} residual_checked_count={} residual_passed_count={} residual_failed_count={} hypothetical_reject_feed_count={} hypothetical_reject_flags_count={} hypothetical_reject_status_count={} hypothetical_reject_deleted_count={} hypothetical_reject_visibility_count={} hypothetical_reject_geo_count={} hypothetical_reject_time_count={} hypothetical_reject_feed_flags_count={} hypothetical_reject_feed_flags_geo_count={} hypothetical_reject_feed_flags_geo_time_count={} metadata_supported_qual_count={} metadata_unsupported_qual_count={} metadata_all_quals_covered={} metadata_unavailable_param_count={} heap_prefilter_after_metadata_count={} heap_prefilter_avoided_count={} metadata_false_negative_count_debug={} block_summary_checked_count={} block_summary_rejected_count={} block_summary_maybe_count={} block_summary_candidates_skipped_count={} prefilter_window_count={} prefilter_window_candidates={} prefilter_window_heap_blocks={} prefilter_window_passed={} vector_window_count={} vector_window_candidates={} vector_window_pages={} vector_window_unique_pages={} build_ms={:.3} rerank_next_ms={:.3} metadata_eval_ms={:.3} metadata_decode_ms={:.3} prefetch_next_ms={:.3} prefilter_fetch_ms={:.3} prefilter_filter_ms={:.3} prefilter_window_ms={:.3} index_vector_read_ms={:.3} index_distance_ms={:.3} vector_window_ms={:.3} heap_fetch_ms={:.3} heap_distance_ms={:.3} total_scan_ms={:.3}",
+        // Emitted at NOTICE so the user sees it inline in psql when
+        // vchordrq.metadata_prefilter_debug = on. The streaming-IO scaffolding
+        // and the `_window`/`_block_summary` counter families from upstream
+        // Sam-fork are intentionally omitted: they're always zero in this fork
+        // (the read-stream/prefetch code paths were excluded by design).
+        pgrx::notice!(
+            "vchordrq_metadata_prefilter \
+opfamily={} probes={} epsilon={} io_search={} io_rerank={} prefilter={} \
+metadata_prefilter_mode={} metadata_schema_cols={} metadata_block_prune={} \
+metadata_supported_qual_count={} metadata_unsupported_qual_count={} \
+metadata_all_quals_covered={} metadata_unavailable_param_count={} \
+metadata_checked={} metadata_rejected={} metadata_survived={} \
+metadata_true={} metadata_maybe={} \
+metadata_rejected_by_feed={} metadata_rejected_by_flags={} \
+metadata_rejected_by_status={} metadata_rejected_by_deleted={} \
+metadata_rejected_by_visibility={} metadata_rejected_by_geo={} \
+metadata_rejected_by_time={} \
+metadata_false_negative_debug={} \
+heap_prefilter_after_metadata={} heap_prefilter_avoided={} \
+prefilter_checked={} prefilter_passed={} \
+candidate_count={} scored_count={} emitted_count={} \
+metadata_eval_ms={:.3} total_scan_ms={:.3}",
             context.opfamily,
             context.probes,
             context.epsilon,
             context.io_search,
             context.io_rerank,
             context.prefilter,
-            context.read_stream_batch,
-            context.prefilter_window,
-            context.vector_read_window,
             context.metadata_prefilter_mode,
             context.metadata_schema_cols,
             context.metadata_block_prune,
-            snapshot.candidate_count,
-            snapshot.candidate_count_before_block_prune,
-            snapshot.candidate_count_after_block_prune,
-            snapshot.scored_count,
-            snapshot.emitted_count,
-            snapshot.prefilter_checked_count,
-            snapshot.prefilter_passed_count,
-            snapshot.index_vector_pages,
+            snapshot.metadata_supported_qual_count,
+            snapshot.metadata_unsupported_qual_count,
+            snapshot.metadata_all_quals_covered,
+            snapshot.metadata_unavailable_param_count,
             snapshot.metadata_checked_count,
             snapshot.metadata_rejected_count,
             snapshot.metadata_survived_count,
@@ -844,51 +857,15 @@ impl Scanner {
             snapshot.metadata_rejected_by_visibility_count,
             snapshot.metadata_rejected_by_geo_count,
             snapshot.metadata_rejected_by_time_count,
-            snapshot.residual_checked_count,
-            snapshot.residual_passed_count,
-            snapshot.residual_failed_count,
-            snapshot.hypothetical_reject_feed_count,
-            snapshot.hypothetical_reject_flags_count,
-            snapshot.hypothetical_reject_status_count,
-            snapshot.hypothetical_reject_deleted_count,
-            snapshot.hypothetical_reject_visibility_count,
-            snapshot.hypothetical_reject_geo_count,
-            snapshot.hypothetical_reject_time_count,
-            snapshot.hypothetical_reject_feed_flags_count,
-            snapshot.hypothetical_reject_feed_flags_geo_count,
-            snapshot.hypothetical_reject_feed_flags_geo_time_count,
-            snapshot.metadata_supported_qual_count,
-            snapshot.metadata_unsupported_qual_count,
-            snapshot.metadata_all_quals_covered,
-            snapshot.metadata_unavailable_param_count,
+            snapshot.metadata_false_negative_count_debug,
             snapshot.heap_prefilter_after_metadata_count,
             snapshot.heap_prefilter_avoided_count,
-            snapshot.metadata_false_negative_count_debug,
-            snapshot.block_summary_checked_count,
-            snapshot.block_summary_rejected_count,
-            snapshot.block_summary_maybe_count,
-            snapshot.block_summary_candidates_skipped_count,
-            snapshot.prefilter_window_count,
-            snapshot.prefilter_window_candidates,
-            snapshot.prefilter_window_heap_blocks,
-            snapshot.prefilter_window_passed,
-            snapshot.vector_window_count,
-            snapshot.vector_window_candidates,
-            snapshot.vector_window_pages,
-            snapshot.vector_window_unique_pages,
-            ns_to_ms(snapshot.build_ns),
-            ns_to_ms(snapshot.rerank_next_ns),
+            snapshot.prefilter_checked_count,
+            snapshot.prefilter_passed_count,
+            snapshot.candidate_count,
+            snapshot.scored_count,
+            snapshot.emitted_count,
             ns_to_ms(snapshot.metadata_eval_ns),
-            ns_to_ms(snapshot.metadata_decode_ns),
-            ns_to_ms(snapshot.prefetch_next_ns),
-            ns_to_ms(snapshot.prefilter_fetch_ns),
-            ns_to_ms(snapshot.prefilter_filter_ns),
-            ns_to_ms(snapshot.prefilter_window_ns),
-            ns_to_ms(snapshot.index_vector_read_ns),
-            ns_to_ms(snapshot.index_distance_ns),
-            ns_to_ms(snapshot.vector_window_ns),
-            ns_to_ms(snapshot.heap_fetch_ns),
-            ns_to_ms(snapshot.heap_distance_ns),
             ns_to_ms(snapshot.total_ns),
         );
     }

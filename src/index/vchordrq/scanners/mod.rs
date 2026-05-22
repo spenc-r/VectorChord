@@ -82,6 +82,11 @@ struct SearchInstrumentationInner {
     logged: Cell<bool>,
 }
 
+// finish_instrumentation in am/mod.rs only emits the metadata-relevant subset
+// of these fields; the rest are intentionally kept populated for future
+// instrumentation surfaces (streaming-IO / per-stage breakdown) without
+// re-threading the snapshot wiring.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct SearchInstrumentationSnapshot {
     pub candidate_count: usize,

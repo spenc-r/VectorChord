@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import statistics
 import time
 
@@ -43,7 +44,12 @@ LIMIT 50
 """
 
 
-def run_timed(cur: psycopg.Cursor, mode: str, debug: bool, repeats: int) -> tuple[list[int], float]:
+DEBUG_NOTICE_PREFIX = "vchordrq_metadata_prefilter "
+
+
+def run_timed(
+    cur: psycopg.Cursor, mode: str, debug: bool, repeats: int, notices: list[str]
+) -> tuple[list[int], float]:
     cur.execute("SET enable_seqscan = off")
     cur.execute("SET vchordrq.prefilter = on")
     cur.execute(f"SET vchordrq.metadata_prefilter = {mode}")
@@ -53,6 +59,7 @@ def run_timed(cur: psycopg.Cursor, mode: str, debug: bool, repeats: int) -> tupl
     )
     cur.execute(f"SET vchordrq.metadata_prefilter_debug = {'on' if debug else 'off'}")
 
+    notices.clear()
     timings = []
     result: list[int] = []
     for _ in range(repeats):
@@ -61,6 +68,11 @@ def run_timed(cur: psycopg.Cursor, mode: str, debug: bool, repeats: int) -> tupl
         result = [row[0] for row in cur.fetchall()]
         timings.append(time.perf_counter() - started)
     return result, statistics.median(timings)
+
+
+def parse_counters(notice_body: str) -> dict[str, str]:
+    """Pull `key=value` pairs out of a vchordrq_metadata_prefilter NOTICE line."""
+    return dict(re.findall(r"(\w+)=([^ ]+)", notice_body))
 
 
 def main() -> None:
@@ -73,6 +85,8 @@ def main() -> None:
 
     with psycopg.connect(args.dsn or f"dbname={os.environ['USER']}") as conn:
         conn.autocommit = True
+        notices: list[str] = []
+        conn.add_notice_handler(lambda diag: notices.append(diag.message_primary))
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vchord")
             cur.execute("DROP TABLE IF EXISTS metadata_prefilter_smoke")
@@ -136,9 +150,56 @@ def main() -> None:
             )
             cur.execute("ANALYZE metadata_prefilter_smoke")
 
-            off_result, off_s = run_timed(cur, "off", False, args.repeats)
-            reject_result, reject_s = run_timed(cur, "reject_only", False, args.repeats)
-            debug_result, debug_s = run_timed(cur, "reject_only", True, args.repeats)
+            off_result, off_s = run_timed(cur, "off", False, args.repeats, notices)
+            if any(n.startswith(DEBUG_NOTICE_PREFIX) for n in notices):
+                raise AssertionError(
+                    "metadata_prefilter_debug=off must not emit any vchordrq NOTICE"
+                )
+
+            reject_result, reject_s = run_timed(
+                cur, "reject_only", False, args.repeats, notices
+            )
+            if any(n.startswith(DEBUG_NOTICE_PREFIX) for n in notices):
+                raise AssertionError(
+                    "metadata_prefilter_debug=off must not emit any vchordrq NOTICE "
+                    "even when metadata_prefilter=reject_only"
+                )
+
+            debug_result, debug_s = run_timed(
+                cur, "reject_only", True, args.repeats, notices
+            )
+            debug_notices = [n for n in notices if n.startswith(DEBUG_NOTICE_PREFIX)]
+            if len(debug_notices) != args.repeats:
+                raise AssertionError(
+                    f"expected one vchordrq_metadata_prefilter NOTICE per repeat "
+                    f"(got {len(debug_notices)} for {args.repeats} repeats)"
+                )
+            counters = parse_counters(debug_notices[0])
+            for required in (
+                "metadata_checked",
+                "metadata_rejected",
+                "metadata_false_negative_debug",
+                "metadata_prefilter_mode",
+            ):
+                if required not in counters:
+                    raise AssertionError(
+                        f"NOTICE is missing expected counter `{required}`: "
+                        f"{debug_notices[0]!r}"
+                    )
+            if counters["metadata_prefilter_mode"] != "reject_only":
+                raise AssertionError(
+                    f"NOTICE reports mode={counters['metadata_prefilter_mode']!r}, "
+                    f"expected reject_only"
+                )
+            if int(counters["metadata_rejected"]) <= 0:
+                raise AssertionError(
+                    f"reject_only mode should have rejected candidates: {debug_notices[0]!r}"
+                )
+            if int(counters["metadata_false_negative_debug"]) != 0:
+                raise AssertionError(
+                    f"debug verification surfaced a false-negative reject: "
+                    f"{debug_notices[0]!r}"
+                )
 
             if off_result != reject_result or reject_result != debug_result:
                 raise AssertionError("metadata prefilter changed query results")
