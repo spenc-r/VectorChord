@@ -554,16 +554,29 @@ SELECT plan_top_index(
 ----
 cost_test_metadata_v
 
-statement ok
-SET vchordrq.metadata_prefilter = off;
-
+# Cost of the vchord plan should be strictly lower under reject_only than
+# under off. We do not assert a plan switch here: on this fixture vchord
+# wins even without the discount because cost_test_metadata_filter (btree
+# on geo_cell_meta) returns ~2500 rows that then have to be sorted by
+# distance, which always loses to vchord's streaming top-K. A plan-shape
+# flip would only happen on a fixture where vchord's cost is within the
+# discount of the btree+sort path, which is narrower than this suite needs.
 query B
-SELECT plan_top_index(
+SELECT metadata_cost_with_settings(
+  'reject_only',
+  'geo',
   'SELECT id FROM cost_test_metadata
    WHERE geo_cell_meta < 13
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
-) IS DISTINCT FROM 'cost_test_metadata_v';
+) < metadata_cost_with_settings(
+  'off',
+  'geo',
+  'SELECT id FROM cost_test_metadata
+   WHERE geo_cell_meta < 13
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+);
 ----
 t
 
