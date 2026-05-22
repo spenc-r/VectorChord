@@ -408,8 +408,10 @@ RESET enable_seqscan;
 
 # ---------------------------------------------------------------------------
 # Case 12: metadata INCLUDE predicates should lower vchord's estimated heap
-# work. With metadata prefiltering enabled, vchord wins against a bitmap+sort
-# path over competing btree metadata indexes without disabling sort.
+# work. On a moderately selective coverable metadata predicate, the discount
+# can tip the planner toward vchord even with sort enabled and a competing
+# btree path available. Very selective btree lookups can still legitimately
+# win because metadata prefiltering does not remove raw IVF startup work.
 # ---------------------------------------------------------------------------
 
 statement ok
@@ -522,8 +524,7 @@ SELECT abs(metadata_cost_with_settings(
 t
 
 statement ok
-CREATE INDEX cost_test_metadata_filter ON cost_test_metadata
-  (feed_id_meta_hash, status_meta, deleted_meta);
+CREATE INDEX cost_test_metadata_filter ON cost_test_metadata (geo_cell_meta);
 
 statement ok
 ANALYZE cost_test_metadata;
@@ -538,7 +539,7 @@ statement ok
 SET vchordrq.prefilter = on;
 
 statement ok
-SET vchordrq.metadata_active_columns = 'feed,status,deleted';
+SET vchordrq.metadata_active_columns = 'geo';
 
 statement ok
 SET vchordrq.metadata_prefilter = reject_only;
@@ -546,9 +547,7 @@ SET vchordrq.metadata_prefilter = reject_only;
 query T
 SELECT plan_top_index(
   'SELECT id FROM cost_test_metadata
-   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
-     AND status_meta = 2
-     AND deleted_meta = 0
+   WHERE geo_cell_meta < 13
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 );
@@ -561,9 +560,7 @@ SET vchordrq.metadata_prefilter = off;
 query B
 SELECT plan_top_index(
   'SELECT id FROM cost_test_metadata
-   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
-     AND status_meta = 2
-     AND deleted_meta = 0
+   WHERE geo_cell_meta < 13
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 ) IS DISTINCT FROM 'cost_test_metadata_v';

@@ -46,26 +46,7 @@ LIMIT 50
 DEBUG_NOTICE_PREFIX = "vchordrq_metadata_prefilter "
 
 
-def assert_vchord_plan(cur: psycopg.Cursor) -> None:
-    cur.execute("SET enable_seqscan = off")
-    cur.execute("SET enable_sort = on")
-    cur.execute("SET vchordrq.prefilter = on")
-    cur.execute("SET vchordrq.metadata_prefilter = 'reject_only'")
-    cur.execute(
-        "SET vchordrq.metadata_active_columns = "
-        "'feed,flags,status,deleted,visibility,geo,time'"
-    )
-    cur.execute(f"EXPLAIN (FORMAT TEXT, COSTS OFF) {QUERY}")
-    plan = "\n".join(row[0] for row in cur.fetchall())
-    if "metadata_prefilter_smoke_idx" not in plan:
-        raise AssertionError(
-            "planner did not choose vchordrq metadata index with sort enabled:\n" + plan
-        )
-
-
-def run_timed(
-    cur: psycopg.Cursor, mode: str, debug: bool, repeats: int, notices: list[str]
-) -> tuple[list[int], float]:
+def configure_prefilter(cur: psycopg.Cursor, mode: str, debug: bool = False) -> None:
     cur.execute("SET enable_seqscan = off")
     cur.execute("SET vchordrq.prefilter = on")
     cur.execute(f"SET vchordrq.metadata_prefilter = {mode}")
@@ -74,6 +55,23 @@ def run_timed(
         "'feed,flags,status,deleted,visibility,geo,time'"
     )
     cur.execute(f"SET vchordrq.metadata_prefilter_debug = {'on' if debug else 'off'}")
+
+
+def assert_vchord_plan(cur: psycopg.Cursor, mode: str, context: str) -> None:
+    configure_prefilter(cur, mode)
+    cur.execute("SET enable_sort = on")
+    cur.execute(f"EXPLAIN (FORMAT TEXT, COSTS OFF) {QUERY}")
+    plan = "\n".join(row[0] for row in cur.fetchall())
+    if "metadata_prefilter_smoke_idx" not in plan:
+        raise AssertionError(
+            f"planner did not choose vchordrq metadata index {context}:\n" + plan
+        )
+
+
+def run_timed(
+    cur: psycopg.Cursor, mode: str, debug: bool, repeats: int, notices: list[str]
+) -> tuple[list[int], float]:
+    configure_prefilter(cur, mode, debug)
 
     notices.clear()
     timings = []
@@ -171,7 +169,19 @@ def main() -> None:
             )
             cur.execute("ANALYZE metadata_prefilter_smoke")
 
-            assert_vchord_plan(cur)
+            assert_vchord_plan(
+                cur,
+                "reject_only",
+                "with competing btree metadata index and sort enabled",
+            )
+
+            # The competing btree exists only for the planner-shape assertion
+            # above. Timings must compare metadata modes on the same vchord
+            # access path, not a btree+sort shortcut in one mode.
+            cur.execute("DROP INDEX metadata_prefilter_smoke_filter_idx")
+            cur.execute("ANALYZE metadata_prefilter_smoke")
+            assert_vchord_plan(cur, "off", "for timed off-mode run")
+            assert_vchord_plan(cur, "reject_only", "for timed reject_only run")
 
             off_result, off_s = run_timed(cur, "off", False, args.repeats, notices)
             if any(n.startswith(DEBUG_NOTICE_PREFIX) for n in notices):
