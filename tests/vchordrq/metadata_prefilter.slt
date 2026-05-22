@@ -68,6 +68,18 @@ lists = []
 $$);
 
 statement ok
+CREATE INDEX metadata_prefilter_feed_idx
+ON metadata_prefilter_items (feed_id_meta_hash);
+
+statement ok
+CREATE INDEX metadata_prefilter_status_idx
+ON metadata_prefilter_items (status_meta);
+
+statement ok
+CREATE INDEX metadata_prefilter_deleted_idx
+ON metadata_prefilter_items (deleted_meta);
+
+statement ok
 CREATE TABLE metadata_prefilter_subset AS
 SELECT * FROM metadata_prefilter_items;
 
@@ -156,6 +168,21 @@ SET vchordrq.metadata_prefilter = reject_only;
 
 statement ok
 SET vchordrq.metadata_active_columns = 'feed,flags,status,deleted,visibility,geo,time';
+
+query T
+SELECT metadata_plan_top_index(
+  'SELECT id FROM metadata_prefilter_items
+   WHERE feed_id_meta_hash = hashtextextended(''feed-2'', 0)
+     AND status_meta = 1
+     AND deleted_meta = 0
+   ORDER BY v <-> ''[0.25,0.25,0.25]''::vector
+   LIMIT 20'
+);
+----
+metadata_prefilter_all_idx
+
+statement ok
+SET enable_sort = on;
 
 query T
 SELECT metadata_plan_top_index(

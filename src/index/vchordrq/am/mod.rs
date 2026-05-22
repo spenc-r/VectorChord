@@ -392,13 +392,38 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             } else {
                 node_count
             };
+            let mut heap_prefilter_count = next_count;
+            let mut metadata_eval_cost = 0.0;
+            if gucs::vchordrq_prefilter()
+                && gucs::vchordrq_metadata_prefilter() != gucs::MetadataPrefilterMode::Off
+                && !gucs::vchordrq_metadata_prefilter_debug()
+            {
+                let schema = metadata::detect_schema(relation.raw());
+                let active = metadata_qual::MetadataActiveColumns::parse(
+                    &gucs::vchordrq_metadata_active_columns(),
+                );
+                if let Some(metadata_cost) =
+                    metadata_qual::planner_metadata_cost(root, path, &schema, &active)
+                {
+                    let metadata_selectivity = if metadata_cost.selectivity.is_finite() {
+                        metadata_cost.selectivity.clamp(filter_selectivity, 1.0)
+                    } else {
+                        1.0
+                    };
+                    heap_prefilter_count =
+                        (next_count * metadata_selectivity).clamp(0.0, next_count);
+                    metadata_eval_cost = next_count
+                        * metadata_cost.supported_qual_count as f64
+                        * pgrx::pg_sys::cpu_operator_cost;
+                }
+            }
             let scan_selectivity = if total_rows > 0.0 {
-                (next_count / total_rows).clamp(1e-9, 1.0)
+                (heap_prefilter_count / total_rows).clamp(1e-9, 1.0)
             } else {
                 1.0
             };
             *index_startup_cost = 0.001 * node_count;
-            *index_total_cost = 0.001 * node_count + next_count;
+            *index_total_cost = 0.001 * node_count + heap_prefilter_count + metadata_eval_cost;
             *index_selectivity = scan_selectivity;
             *index_correlation = 0.0;
             *index_pages = page_count;
