@@ -44,6 +44,19 @@ LIMIT 50
 """
 
 DEBUG_NOTICE_PREFIX = "vchordrq_metadata_prefilter "
+QUAL_DIAGNOSTICS_PREFIX = "vchordrq_metadata_qual_diagnostics "
+
+GENERIC_PARAM_QUERY = f"""
+SELECT id
+FROM metadata_prefilter_smoke
+WHERE tenant_hash = hashtextextended('feed-10', 0)
+  AND state_code = %(state)s::bigint
+  AND deletion_marker = %(deleted)s::bigint
+  AND (flag_bits & %(mask)s::bigint) = %(mask)s::bigint
+  AND geo_token = ANY(%(geo)s::bigint[])
+ORDER BY v <-> ('[' || array_to_string(array_fill(0.13::real, ARRAY[{VECTOR_DIM}]), ',') || ']')::vector
+LIMIT 50
+"""
 
 
 def configure_prefilter(cur: psycopg.Cursor, mode: str, debug: bool = False) -> None:
@@ -87,6 +100,59 @@ def run_timed(
 def parse_counters(notice_body: str) -> dict[str, str]:
     """Pull `key=value` pairs out of a vchordrq_metadata_prefilter NOTICE line."""
     return dict(re.findall(r"(\w+)=([^ ]+)", notice_body))
+
+
+def assert_generic_param_metadata_quals(
+    cur: psycopg.Cursor, notices: list[str]
+) -> None:
+    cur.execute("SET client_min_messages = log")
+    cur.execute("SET enable_seqscan = off")
+    cur.execute("SET enable_bitmapscan = off")
+    cur.execute("SET plan_cache_mode = force_generic_plan")
+    cur.execute("SET vchordrq.prefilter = on")
+    cur.execute("SET vchordrq.metadata_prefilter = reject_only")
+    cur.execute(
+        "SET vchordrq.metadata_active_columns = "
+        "'tenant_hash,state_code,deletion_marker,flag_bits,geo_token'"
+    )
+    cur.execute("SET vchordrq.metadata_qual_diagnostics = on")
+
+    notices.clear()
+    cur.execute(
+        GENERIC_PARAM_QUERY,
+        {
+            "state": 0,
+            "deleted": 0,
+            "mask": 3,
+            "geo": [10, 20, 30, 40, 50],
+        },
+        prepare=True,
+    )
+    cur.fetchall()
+    diagnostics = [n for n in notices if n.startswith(QUAL_DIAGNOSTICS_PREFIX)]
+    if not diagnostics:
+        raise AssertionError("expected vchordrq metadata qual diagnostics NOTICE")
+    counters = parse_counters(diagnostics[-1])
+    expected_columns = {
+        "tenant_hash",
+        "state_code",
+        "deletion_marker",
+        "flag_bits",
+        "geo_token",
+    }
+    detected_columns = set(counters.get("metadata_detected_columns", "").split(","))
+    if counters.get("metadata_supported_qual_count") != "5":
+        raise AssertionError(f"generic params should support all quals: {diagnostics[-1]!r}")
+    if counters.get("metadata_unsupported_qual_count") != "0":
+        raise AssertionError(f"generic params should not leave unsupported quals: {diagnostics[-1]!r}")
+    if counters.get("metadata_unavailable_param_count") != "0":
+        raise AssertionError(f"generic params should resolve once per scan: {diagnostics[-1]!r}")
+    if not expected_columns.issubset(detected_columns):
+        raise AssertionError(f"missing generic-param metadata columns: {diagnostics[-1]!r}")
+
+    cur.execute("SET vchordrq.metadata_qual_diagnostics = off")
+    cur.execute("SET plan_cache_mode = auto")
+    cur.execute("RESET client_min_messages")
 
 
 def main() -> None:
@@ -192,6 +258,7 @@ def main() -> None:
             cur.execute("ANALYZE metadata_prefilter_smoke")
             assert_vchord_plan(cur, "off", "for timed off-mode run")
             assert_vchord_plan(cur, "reject_only", "for timed reject_only run")
+            assert_generic_param_metadata_quals(cur, notices)
 
             off_result, off_s = run_timed(cur, "off", False, args.repeats, notices)
             if any(n.startswith(DEBUG_NOTICE_PREFIX) for n in notices):

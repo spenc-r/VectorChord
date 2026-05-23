@@ -649,7 +649,7 @@ unsafe fn planner_bitmask_contains_is_coverable(
         let Some(expected) = scalar_value_for_node(right, ptr::null_mut(), &var.name) else {
             return false;
         };
-        expected.supported && expected.value == Some(mask)
+        expected.supported && expected.same_planner_value(&mask)
     }
 }
 
@@ -657,7 +657,7 @@ unsafe fn planner_int8_and(
     node: *mut pg_sys::Node,
     index_info: *mut pg_sys::IndexOptInfo,
     schema: &MetadataSchema,
-) -> Option<(MetadataVar, i64)> {
+) -> Option<(MetadataVar, DetectedScalar)> {
     unsafe {
         let node = strip_relabel(node);
         if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_OpExpr {
@@ -681,14 +681,14 @@ unsafe fn planner_int8_and_operands(
     value_node: *mut pg_sys::Node,
     index_info: *mut pg_sys::IndexOptInfo,
     schema: &MetadataSchema,
-) -> Option<(MetadataVar, i64)> {
+) -> Option<(MetadataVar, DetectedScalar)> {
     let var = unsafe { planner_metadata_var(var_node, index_info, schema)? };
     if var.vartype != pg_sys::INT8OID {
         return None;
     }
     let mask = unsafe { scalar_value_for_node(value_node, ptr::null_mut(), &var.name)? };
     if mask.supported {
-        Some((var, mask.value?))
+        Some((var, mask))
     } else {
         None
     }
@@ -847,9 +847,25 @@ unsafe fn inspect_int8_and_operands(
 struct DetectedScalar {
     supported: bool,
     value: Option<i64>,
+    identity: Option<ScalarIdentity>,
     unavailable_param: bool,
     description: String,
     param_description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScalarIdentity {
+    Const(i64),
+    ExternalParam(i32),
+}
+
+impl DetectedScalar {
+    fn same_planner_value(&self, other: &Self) -> bool {
+        match (self.value, other.value) {
+            (Some(left), Some(right)) => left == right,
+            _ => self.identity.is_some() && self.identity == other.identity,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -872,12 +888,26 @@ unsafe fn scalar_value_for_node(
             return None;
         }
         match (*node).type_ {
+            pg_sys::NodeTag::T_FuncExpr => {
+                let expr = node.cast::<pg_sys::FuncExpr>();
+                if !is_int8_widening_cast((*expr).funcid)
+                    || (*expr).funcresulttype != pg_sys::INT8OID
+                {
+                    return None;
+                }
+                let args = list_nodes((*expr).args);
+                if args.len() != 1 {
+                    return None;
+                }
+                scalar_value_for_node(args[0], plan_state, column_name)
+            }
             pg_sys::NodeTag::T_Const => {
                 let value = node.cast::<pg_sys::Const>();
                 if !is_supported_integer_type((*value).consttype) {
                     return Some(DetectedScalar {
                         supported: false,
                         value: None,
+                        identity: None,
                         unavailable_param: false,
                         description: format!(
                             "const(<unsupported-type:{}>)",
@@ -890,6 +920,7 @@ unsafe fn scalar_value_for_node(
                     return Some(DetectedScalar {
                         supported: false,
                         value: None,
+                        identity: None,
                         unavailable_param: false,
                         description: "const(NULL)".to_owned(),
                         param_description: None,
@@ -899,6 +930,7 @@ unsafe fn scalar_value_for_node(
                 Some(DetectedScalar {
                     supported: true,
                     value: Some(value),
+                    identity: Some(ScalarIdentity::Const(value)),
                     unavailable_param: false,
                     description: format!("const({value})"),
                     param_description: None,
@@ -910,6 +942,7 @@ unsafe fn scalar_value_for_node(
                     return Some(DetectedScalar {
                         supported: false,
                         value: None,
+                        identity: None,
                         unavailable_param: false,
                         description: format!(
                             "param${}(<unsupported-type:{}>)",
@@ -927,6 +960,9 @@ unsafe fn scalar_value_for_node(
                 let (supported, value, unavailable_param, param_value) = match fetched {
                     ParamValue::Int8(value) => (true, Some(value), false, value.to_string()),
                     ParamValue::Null => (false, None, false, "NULL".to_owned()),
+                    ParamValue::Unavailable if plan_state.is_null() => {
+                        (true, None, false, "unresolved".to_owned())
+                    }
                     ParamValue::Unavailable => (false, None, true, "unavailable".to_owned()),
                     ParamValue::UnsupportedKind(kind) => {
                         (false, None, false, format!("unsupported-kind:{kind}"))
@@ -936,6 +972,7 @@ unsafe fn scalar_value_for_node(
                 Some(DetectedScalar {
                     supported,
                     value,
+                    identity: Some(ScalarIdentity::ExternalParam((*param).paramid)),
                     unavailable_param,
                     description: format!("param${}({})", (*param).paramid, param_value),
                     param_description: Some(format!("${}={}", (*param).paramid, param_value)),
@@ -960,9 +997,25 @@ unsafe fn array_values_for_node(
             return None;
         }
         match (*node).type_ {
+            pg_sys::NodeTag::T_ArrayCoerceExpr => {
+                let expr = node.cast::<pg_sys::ArrayCoerceExpr>();
+                if (*expr).resulttype != pg_sys::INT8ARRAYOID {
+                    return Some(DetectedArray {
+                        supported: false,
+                        values: Vec::new(),
+                        unavailable_param: false,
+                        description: format!(
+                            "array_cast(<unsupported-type:{}>)",
+                            (*expr).resulttype.to_u32()
+                        ),
+                        param_descriptions: Vec::new(),
+                    });
+                }
+                array_values_for_node((*expr).arg.cast(), plan_state, column_name)
+            }
             pg_sys::NodeTag::T_Const => {
                 let value = node.cast::<pg_sys::Const>();
-                if (*value).consttype != pg_sys::INT8ARRAYOID || (*value).constisnull {
+                let Some(element_type) = integer_array_element_type((*value).consttype) else {
                     return Some(DetectedArray {
                         supported: false,
                         values: Vec::new(),
@@ -970,8 +1023,17 @@ unsafe fn array_values_for_node(
                         description: "const(<unsupported-array>)".to_owned(),
                         param_descriptions: Vec::new(),
                     });
+                };
+                if (*value).constisnull {
+                    return Some(DetectedArray {
+                        supported: false,
+                        values: Vec::new(),
+                        unavailable_param: false,
+                        description: "const(NULL)".to_owned(),
+                        param_descriptions: Vec::new(),
+                    });
                 }
-                let values = int8_array_values((*value).constvalue);
+                let values = integer_array_values(element_type, (*value).constvalue);
                 Some(DetectedArray {
                     supported: true,
                     description: format!("const_array({})", values.len()),
@@ -982,7 +1044,7 @@ unsafe fn array_values_for_node(
             }
             pg_sys::NodeTag::T_Param => {
                 let param = node.cast::<pg_sys::Param>();
-                if (*param).paramtype != pg_sys::INT8ARRAYOID {
+                if integer_array_element_type((*param).paramtype).is_none() {
                     return Some(DetectedArray {
                         supported: false,
                         values: Vec::new(),
@@ -1006,6 +1068,9 @@ unsafe fn array_values_for_node(
                         (true, values, false, format!("array({len})"))
                     }
                     ParamValue::Null => (false, Vec::new(), false, "NULL".to_owned()),
+                    ParamValue::Unavailable if plan_state.is_null() => {
+                        (true, Vec::new(), false, "unresolved".to_owned())
+                    }
                     ParamValue::Unavailable => (false, Vec::new(), true, "unavailable".to_owned()),
                     ParamValue::UnsupportedKind(kind) => {
                         (false, Vec::new(), false, format!("unsupported-kind:{kind}"))
@@ -1070,24 +1135,37 @@ unsafe fn fetch_param_value(
             pg_sys::INT8OID | pg_sys::INT4OID | pg_sys::INT2OID => ParamValue::Int8(
                 integer_datum_value((*param_data).ptype, (*param_data).value),
             ),
-            pg_sys::INT8ARRAYOID => ParamValue::Int8Array(int8_array_values((*param_data).value)),
+            pg_sys::INT8ARRAYOID | pg_sys::INT4ARRAYOID | pg_sys::INT2ARRAYOID => {
+                let element_type = integer_array_element_type((*param_data).ptype)
+                    .expect("supported integer array type must have an element type");
+                ParamValue::Int8Array(integer_array_values(element_type, (*param_data).value))
+            }
             _ => ParamValue::Unavailable,
         }
     }
 }
 
-unsafe fn int8_array_values(datum: pg_sys::Datum) -> Vec<i64> {
+fn integer_array_element_type(array_type: pg_sys::Oid) -> Option<pg_sys::Oid> {
+    match array_type {
+        pg_sys::INT8ARRAYOID => Some(pg_sys::INT8OID),
+        pg_sys::INT4ARRAYOID => Some(pg_sys::INT4OID),
+        pg_sys::INT2ARRAYOID => Some(pg_sys::INT2OID),
+        _ => None,
+    }
+}
+
+unsafe fn integer_array_values(element_type: pg_sys::Oid, datum: pg_sys::Datum) -> Vec<i64> {
     unsafe {
         let mut typlen = 0;
         let mut typbyval = false;
         let mut typalign = 0;
-        pg_sys::get_typlenbyvalalign(pg_sys::INT8OID, &mut typlen, &mut typbyval, &mut typalign);
+        pg_sys::get_typlenbyvalalign(element_type, &mut typlen, &mut typbyval, &mut typalign);
         let mut elements: *mut pg_sys::Datum = ptr::null_mut();
         let mut nulls: *mut bool = ptr::null_mut();
         let mut nelems = 0;
         pg_sys::deconstruct_array(
             datum.cast_mut_ptr::<pg_sys::ArrayType>(),
-            pg_sys::INT8OID,
+            element_type,
             typlen.into(),
             typbyval,
             typalign,
@@ -1100,7 +1178,7 @@ unsafe fn int8_array_values(datum: pg_sys::Datum) -> Vec<i64> {
             if !nulls.is_null() && nulls.add(i).read() {
                 continue;
             }
-            values.push(elements.add(i).read().value() as i64);
+            values.push(integer_datum_value(element_type, elements.add(i).read()));
         }
         values
     }
@@ -1329,6 +1407,10 @@ unsafe fn int8_binary_op(expr: *mut pg_sys::OpExpr) -> Option<Int8BinaryOp> {
 
 fn is_supported_integer_type(oid: pg_sys::Oid) -> bool {
     oid == pg_sys::INT8OID || oid == pg_sys::INT4OID || oid == pg_sys::INT2OID
+}
+
+fn is_int8_widening_cast(func: pg_sys::Oid) -> bool {
+    matches!(func.to_u32(), pg_sys::F_INT8_INT4 | pg_sys::F_INT8_INT2)
 }
 
 fn integer_datum_value(oid: pg_sys::Oid, datum: pg_sys::Datum) -> i64 {

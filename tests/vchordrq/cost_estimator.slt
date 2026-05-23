@@ -555,6 +555,73 @@ SELECT abs(metadata_cost_with_settings(
 ----
 t
 
+# Generic plans from drivers can wrap small integer params in casts to match
+# bigint metadata columns. Those casted params must still receive the metadata
+# cost discount.
+statement ok
+SET plan_cache_mode = force_generic_plan;
+
+statement ok
+PREPARE cost_test_metadata_generic_reject(smallint, smallint, smallint[]) AS
+SELECT id FROM cost_test_metadata
+WHERE state_code = $1::bigint
+  AND deletion_marker = $2::bigint
+  AND geo_token = ANY($3::bigint[])
+ORDER BY v <-> '[0.13,0.21,0.34]'::vector
+LIMIT 50;
+
+statement ok
+PREPARE cost_test_metadata_generic_off(smallint, smallint, smallint[]) AS
+SELECT id FROM cost_test_metadata
+WHERE state_code = $1::bigint
+  AND deletion_marker = $2::bigint
+  AND geo_token = ANY($3::bigint[])
+ORDER BY v <-> '[0.13,0.21,0.34]'::vector
+LIMIT 50;
+
+query B
+SELECT metadata_cost_with_settings(
+  'reject_only',
+  'state_code,deletion_marker,geo_token',
+  'EXECUTE cost_test_metadata_generic_reject(
+     2::smallint, 0::smallint, ARRAY[17,42,99]::smallint[]
+   )'
+) < metadata_cost_with_settings(
+  'off',
+  'state_code,deletion_marker,geo_token',
+  'EXECUTE cost_test_metadata_generic_off(
+     2::smallint, 0::smallint, ARRAY[17,42,99]::smallint[]
+   )'
+);
+----
+t
+
+query B
+SELECT metadata_cost_with_settings(
+  'off',
+  'state_code,deletion_marker,geo_token',
+  'EXECUTE cost_test_metadata_generic_off(
+     2::smallint, 0::smallint, ARRAY[17,42,99]::smallint[]
+   )'
+) - metadata_cost_with_settings(
+  'reject_only',
+  'state_code,deletion_marker,geo_token',
+  'EXECUTE cost_test_metadata_generic_reject(
+     2::smallint, 0::smallint, ARRAY[17,42,99]::smallint[]
+   )'
+) > 100.0;
+----
+t
+
+statement ok
+RESET plan_cache_mode;
+
+statement ok
+DEALLOCATE cost_test_metadata_generic_reject;
+
+statement ok
+DEALLOCATE cost_test_metadata_generic_off;
+
 statement ok
 CREATE INDEX cost_test_metadata_filter ON cost_test_metadata (geo_token);
 
