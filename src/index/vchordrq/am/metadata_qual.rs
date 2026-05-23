@@ -199,7 +199,10 @@ pub unsafe fn planner_metadata_cost(
             let clause = (*rinfo).clause.cast::<pg_sys::Node>();
             if planner_qual_is_coverable(clause, index_info, schema, active) {
                 supported_qual_count += 1;
-                metadata_quals = pg_sys::lappend(metadata_quals, rinfo.cast());
+                // Estimate the metadata-only selectivity from the raw clause.
+                // Reusing the planner's RestrictInfo can collapse to 1.0 here
+                // after baserel row estimates have already accounted for it.
+                metadata_quals = pg_sys::lappend(metadata_quals, clause.cast());
             }
         });
         if supported_qual_count == 0 || metadata_quals.is_null() {

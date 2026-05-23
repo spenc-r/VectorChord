@@ -424,6 +424,8 @@ CREATE TABLE cost_test_metadata (
   v                        vector(3) NOT NULL
 );
 
+# Large enough to catch regressions where planner-side metadata selectivity
+# falls back to 1.0 and reject_only only adds metadata_eval_cost.
 statement ok
 INSERT INTO cost_test_metadata
 SELECT i,
@@ -439,7 +441,7 @@ SELECT i,
          (i % 991) / 991.0,
          (i % 983) / 983.0
        ]::real[]::vector
-FROM generate_series(1, 50000) i;
+FROM generate_series(1, 1000000) i;
 
 statement ok
 CREATE INDEX cost_test_metadata_v ON cost_test_metadata
@@ -485,6 +487,29 @@ SELECT metadata_cost_with_settings(
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 );
+----
+t
+
+query B
+SELECT metadata_cost_with_settings(
+  'off',
+  'tenant_hash,state_code,deletion_marker',
+  'SELECT id FROM cost_test_metadata
+   WHERE tenant_hash = hashtextextended(''feed-17'', 0)
+     AND state_code = 2
+     AND deletion_marker = 0
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+) - metadata_cost_with_settings(
+  'reject_only',
+  'tenant_hash,state_code,deletion_marker',
+  'SELECT id FROM cost_test_metadata
+   WHERE tenant_hash = hashtextextended(''feed-17'', 0)
+     AND state_code = 2
+     AND deletion_marker = 0
+   ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
+   LIMIT 50'
+) > 100.0;
 ----
 t
 
