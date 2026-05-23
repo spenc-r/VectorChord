@@ -417,10 +417,10 @@ RESET enable_seqscan;
 statement ok
 CREATE TABLE cost_test_metadata (
   id                       int PRIMARY KEY,
-  feed_id_meta_hash        bigint,
-  status_meta              bigint,
-  deleted_meta             bigint,
-  geo_cell_meta            bigint,
+  tenant_hash              bigint,
+  state_code               bigint,
+  deletion_marker          bigint,
+  geo_token                bigint,
   v                        vector(3) NOT NULL
 );
 
@@ -444,10 +444,17 @@ FROM generate_series(1, 50000) i;
 statement ok
 CREATE INDEX cost_test_metadata_v ON cost_test_metadata
 USING vchordrq (v vector_l2_ops)
-INCLUDE (feed_id_meta_hash, status_meta, deleted_meta, geo_cell_meta)
+INCLUDE (tenant_hash, state_code, deletion_marker, geo_token)
 WITH (options = $$
 residual_quantization = false
 rerank_in_table = false
+[metadata]
+columns = [
+  { name = "tenant_hash", ops = ["eq", "in"], exact = false },
+  { name = "state_code", ops = ["eq", "in"], exact = true },
+  { name = "deletion_marker", ops = ["eq"], exact = true },
+  { name = "geo_token", ops = ["eq", "in", "range"], exact = false },
+]
 [build.internal]
 lists = []
 $$);
@@ -461,20 +468,20 @@ SET enable_seqscan = off;
 query B
 SELECT metadata_cost_with_settings(
   'reject_only',
-  'feed,status,deleted',
+  'tenant_hash,state_code,deletion_marker',
   'SELECT id FROM cost_test_metadata
-   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
-     AND status_meta = 2
-     AND deleted_meta = 0
+   WHERE tenant_hash = hashtextextended(''feed-17'', 0)
+     AND state_code = 2
+     AND deletion_marker = 0
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 ) < metadata_cost_with_settings(
   'off',
-  'feed,status,deleted',
+  'tenant_hash,state_code,deletion_marker',
   'SELECT id FROM cost_test_metadata
-   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
-     AND status_meta = 2
-     AND deleted_meta = 0
+   WHERE tenant_hash = hashtextextended(''feed-17'', 0)
+     AND state_code = 2
+     AND deletion_marker = 0
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 );
@@ -486,18 +493,18 @@ SELECT abs(metadata_cost_with_settings(
   'reject_only',
   '',
   'SELECT id FROM cost_test_metadata
-   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
-     AND status_meta = 2
-     AND deleted_meta = 0
+   WHERE tenant_hash = hashtextextended(''feed-17'', 0)
+     AND state_code = 2
+     AND deletion_marker = 0
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 ) - metadata_cost_with_settings(
-  'off',
-  'feed,status,deleted',
+  'reject_only',
+  'tenant_hash,state_code,deletion_marker',
   'SELECT id FROM cost_test_metadata
-   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
-     AND status_meta = 2
-     AND deleted_meta = 0
+   WHERE tenant_hash = hashtextextended(''feed-17'', 0)
+     AND state_code = 2
+     AND deletion_marker = 0
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 )) < 0.01;
@@ -507,16 +514,16 @@ t
 query B
 SELECT abs(metadata_cost_with_settings(
   'reject_only',
-  'feed,status,deleted',
+  'tenant_hash,state_code,deletion_marker',
   'SELECT id FROM cost_test_metadata
-   WHERE feed_id_meta_hash IS NULL
+   WHERE tenant_hash IS NULL
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 ) - metadata_cost_with_settings(
   'off',
-  'feed,status,deleted',
+  'tenant_hash,state_code,deletion_marker',
   'SELECT id FROM cost_test_metadata
-   WHERE feed_id_meta_hash IS NULL
+   WHERE tenant_hash IS NULL
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 )) < 0.01;
@@ -524,7 +531,7 @@ SELECT abs(metadata_cost_with_settings(
 t
 
 statement ok
-CREATE INDEX cost_test_metadata_filter ON cost_test_metadata (geo_cell_meta);
+CREATE INDEX cost_test_metadata_filter ON cost_test_metadata (geo_token);
 
 statement ok
 ANALYZE cost_test_metadata;
@@ -539,7 +546,7 @@ statement ok
 SET vchordrq.prefilter = on;
 
 statement ok
-SET vchordrq.metadata_active_columns = 'geo';
+SET vchordrq.metadata_active_columns = 'geo_token';
 
 statement ok
 SET vchordrq.metadata_prefilter = reject_only;
@@ -547,7 +554,7 @@ SET vchordrq.metadata_prefilter = reject_only;
 query T
 SELECT plan_top_index(
   'SELECT id FROM cost_test_metadata
-   WHERE geo_cell_meta < 13
+   WHERE geo_token < 13
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 );
@@ -557,23 +564,23 @@ cost_test_metadata_v
 # Cost of the vchord plan should be strictly lower under reject_only than
 # under off. We do not assert a plan switch here: on this fixture vchord
 # wins even without the discount because cost_test_metadata_filter (btree
-# on geo_cell_meta) returns ~2500 rows that then have to be sorted by
+# on geo_token) returns ~2500 rows that then have to be sorted by
 # distance, which always loses to vchord's streaming top-K. A plan-shape
 # flip would only happen on a fixture where vchord's cost is within the
 # discount of the btree+sort path, which is narrower than this suite needs.
 query B
 SELECT metadata_cost_with_settings(
   'reject_only',
-  'geo',
+  'geo_token',
   'SELECT id FROM cost_test_metadata
-   WHERE geo_cell_meta < 13
+   WHERE geo_token < 13
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 ) < metadata_cost_with_settings(
   'off',
-  'geo',
+  'geo_token',
   'SELECT id FROM cost_test_metadata
-   WHERE geo_cell_meta < 13
+   WHERE geo_token < 13
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 );
@@ -607,20 +614,20 @@ SET enable_seqscan = off;
 query B
 SELECT abs(metadata_cost_with_settings(
   'reject_only',
-  'feed,status,deleted',
+  'tenant_hash,state_code,deletion_marker',
   'SELECT id FROM cost_test_metadata_plain
-   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
-     AND status_meta = 2
-     AND deleted_meta = 0
+   WHERE tenant_hash = hashtextextended(''feed-17'', 0)
+     AND state_code = 2
+     AND deletion_marker = 0
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 ) - metadata_cost_with_settings(
   'off',
-  'feed,status,deleted',
+  'tenant_hash,state_code,deletion_marker',
   'SELECT id FROM cost_test_metadata_plain
-   WHERE feed_id_meta_hash = hashtextextended(''feed-17'', 0)
-     AND status_meta = 2
-     AND deleted_meta = 0
+   WHERE tenant_hash = hashtextextended(''feed-17'', 0)
+     AND state_code = 2
+     AND deletion_marker = 0
    ORDER BY v <-> ''[0.13,0.21,0.34]''::vector
    LIMIT 50'
 )) < 0.01;

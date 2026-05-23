@@ -1,58 +1,36 @@
 use pgrx::pg_sys;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CStr;
+use validator::Validate;
 
-pub const FEED_ID_META_HASH: &str = "feed_id_meta_hash";
-pub const STATUS_META: &str = "status_meta";
-pub const VISIBILITY_META: &str = "visibility_meta";
-pub const DELETED_META: &str = "deleted_meta";
-pub const ELIGIBILITY_FLAGS_META: &str = "eligibility_flags_meta";
-pub const GEO_CELL_META: &str = "geo_cell_meta";
-pub const CREATED_AT_BUCKET_META: &str = "created_at_bucket_meta";
+use super::Reloption;
+use crate::index::vchordrq::types::{VchordrqIndexingOptions, VchordrqMetadataColumnOp};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MetadataColumnKind {
-    Feed,
-    Flags,
-    Status,
-    Deleted,
-    Visibility,
-    Geo,
-    Time,
-    Other,
+pub type MetadataColumnOp = VchordrqMetadataColumnOp;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataColumnSemantics {
+    ops: BTreeSet<MetadataColumnOp>,
+    pub exact: bool,
 }
 
-impl MetadataColumnKind {
-    pub fn from_name(name: &str) -> Self {
-        match name {
-            FEED_ID_META_HASH => Self::Feed,
-            ELIGIBILITY_FLAGS_META => Self::Flags,
-            STATUS_META => Self::Status,
-            DELETED_META => Self::Deleted,
-            VISIBILITY_META => Self::Visibility,
-            GEO_CELL_META => Self::Geo,
-            CREATED_AT_BUCKET_META => Self::Time,
-            _ => Self::Other,
+impl MetadataColumnSemantics {
+    pub fn new(ops: impl IntoIterator<Item = MetadataColumnOp>, exact: bool) -> Self {
+        Self {
+            ops: ops.into_iter().collect(),
+            exact,
         }
     }
 
-    pub const fn active_name(self) -> &'static str {
-        match self {
-            Self::Feed => "feed",
-            Self::Flags => "flags",
-            Self::Status => "status",
-            Self::Deleted => "deleted",
-            Self::Visibility => "visibility",
-            Self::Geo => "geo",
-            Self::Time => "time",
-            Self::Other => "other",
-        }
+    pub fn supports(&self, op: MetadataColumnOp) -> bool {
+        self.ops.contains(&op)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct MetadataColumn {
     pub name: String,
-    pub kind: MetadataColumnKind,
+    pub semantics: Option<MetadataColumnSemantics>,
     pub index_attno: usize,
     pub metadata_index: usize,
 }
@@ -74,6 +52,17 @@ impl MetadataSchema {
     pub fn by_name(&self, name: &str) -> Option<&MetadataColumn> {
         self.columns.iter().find(|column| column.name == name)
     }
+
+    pub fn declared_by_name(&self, name: &str) -> Option<&MetadataColumn> {
+        self.columns
+            .iter()
+            .find(|column| column.name == name && column.semantics.is_some())
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(columns: Vec<MetadataColumn>) -> Self {
+        Self { columns }
+    }
 }
 
 pub unsafe fn detect_schema(index_relation: pg_sys::Relation) -> MetadataSchema {
@@ -94,10 +83,18 @@ pub unsafe fn detect_schema(index_relation: pg_sys::Relation) -> MetadataSchema 
                 vchordrq::MAX_METADATA_ATTRS
             );
         }
+        let declared = declared_metadata(index_relation);
         if (*index).indnatts == 1 {
+            if let Some(name) = declared.keys().next() {
+                pgrx::error!(
+                    "vchordrq declared metadata column `{}` must be a bigint INCLUDE column",
+                    name
+                );
+            }
             return MetadataSchema::default();
         }
         let atts = index_attrs(index_relation);
+        let mut seen_include_names = BTreeSet::new();
         let mut columns = Vec::with_capacity((*index).indnatts as usize - 1);
         for index_attno in 1..(*index).indnatts as usize {
             let Some(att) = atts.get(index_attno) else {
@@ -110,14 +107,48 @@ pub unsafe fn detect_schema(index_relation: pg_sys::Relation) -> MetadataSchema 
                 .to_str()
                 .unwrap_or_default()
                 .to_owned();
+            seen_include_names.insert(name.clone());
             columns.push(MetadataColumn {
-                kind: MetadataColumnKind::from_name(&name),
+                semantics: declared.get(&name).cloned(),
                 name,
                 index_attno,
                 metadata_index: index_attno - 1,
             });
         }
+        for name in declared.keys() {
+            if !seen_include_names.contains(name) {
+                pgrx::error!(
+                    "vchordrq declared metadata column `{}` must be a bigint INCLUDE column",
+                    name
+                );
+            }
+        }
         MetadataSchema { columns }
+    }
+}
+
+unsafe fn declared_metadata(
+    index_relation: pg_sys::Relation,
+) -> BTreeMap<String, MetadataColumnSemantics> {
+    unsafe {
+        let reloption = (*index_relation).rd_options as *const Reloption;
+        let s = Reloption::options(reloption, c"").to_string_lossy();
+        let options = match toml::from_str::<VchordrqIndexingOptions>(&s) {
+            Ok(options) => options,
+            Err(error) => pgrx::error!("failed to parse options: {}", error),
+        };
+        if let Err(errors) = Validate::validate(&options) {
+            pgrx::error!("failed to validate options: {errors}");
+        }
+        options
+            .metadata
+            .columns
+            .into_iter()
+            .map(|column| {
+                let semantics = MetadataColumnSemantics::new(column.ops, column.exact);
+                (column.name, semantics)
+            })
+            .collect()
     }
 }
 

@@ -233,8 +233,8 @@ pub fn init() {
     );
     GucRegistry::define_string_guc(
         c"vchordrq.metadata_active_columns",
-        c"Comma-separated vchordrq metadata predicates to activate.",
-        c"Comma-separated vchordrq metadata predicates to activate.",
+        c"Comma-separated vchordrq metadata column names to activate.",
+        c"Comma-separated vchordrq metadata column names to activate.",
         &VCHORDRQ_METADATA_ACTIVE_COLUMNS,
         GucContext::Userset,
         GucFlags::default(),

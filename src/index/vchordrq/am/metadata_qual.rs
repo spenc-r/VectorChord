@@ -18,9 +18,9 @@ use std::ffi::CStr;
 use std::ptr;
 use std::ptr::NonNull;
 
-use super::metadata::{MetadataColumnKind, MetadataSchema};
+use super::metadata::{MetadataColumnOp, MetadataColumnSemantics, MetadataSchema};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompiledMetadataQual {
     pub predicates: Vec<MetadataPredicate>,
     pub supported_qual_count: usize,
@@ -29,23 +29,11 @@ pub struct CompiledMetadataQual {
     pub unavailable_param_count: usize,
 }
 
-impl Default for CompiledMetadataQual {
-    fn default() -> Self {
-        Self {
-            predicates: Vec::new(),
-            supported_qual_count: 0,
-            unsupported_qual_count: 0,
-            all_quals_covered: false,
-            unavailable_param_count: 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct MetadataPredicate {
     pub metadata_index: usize,
-    pub kind: MetadataColumnKind,
     pub column_name: String,
+    pub exact: bool,
     pub op: MetadataPredicateOp,
 }
 
@@ -75,53 +63,52 @@ impl MetadataPredicate {
     }
 
     pub const fn is_exact_for_heap_skip(&self) -> bool {
-        matches!(
-            self.kind,
-            MetadataColumnKind::Flags
-                | MetadataColumnKind::Status
-                | MetadataColumnKind::Deleted
-                | MetadataColumnKind::Visibility
-        )
+        self.exact
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct MetadataActiveColumns {
     all: bool,
-    active: BTreeSet<MetadataColumnKind>,
+    active: BTreeSet<String>,
 }
 
 impl MetadataActiveColumns {
-    pub fn parse(value: &str) -> Self {
+    pub fn parse(value: &str, schema: &MetadataSchema) -> Self {
         let mut active = BTreeSet::new();
         let mut all = false;
+        let mut saw_column_token = false;
         for raw in value.split(',') {
-            let token = raw.trim().to_ascii_lowercase();
+            let token = raw.trim();
             if token.is_empty() {
                 continue;
             }
-            if token == "all" || token == "*" {
+            if token.eq_ignore_ascii_case("all") || token == "*" {
                 all = true;
                 continue;
             }
-            let kind = match token.as_str() {
-                "feed" | "feed_id_meta_hash" => MetadataColumnKind::Feed,
-                "flags" | "eligibility_flags_meta" => MetadataColumnKind::Flags,
-                "status" | "status_meta" => MetadataColumnKind::Status,
-                "deleted" | "deleted_meta" => MetadataColumnKind::Deleted,
-                "visibility" | "visibility_meta" => MetadataColumnKind::Visibility,
-                "geo" | "geo_cell_meta" => MetadataColumnKind::Geo,
-                "time" | "created_at_bucket_meta" => MetadataColumnKind::Time,
-                "other" => MetadataColumnKind::Other,
-                _ => continue,
-            };
-            active.insert(kind);
+            saw_column_token = true;
+            if schema.declared_by_name(token).is_some() {
+                active.insert(token.to_owned());
+            }
+        }
+        if !saw_column_token {
+            all = true;
+        }
+        if all {
+            active = schema
+                .columns()
+                .iter()
+                .filter(|column| column.semantics.is_some())
+                .map(|column| column.name.clone())
+                .collect();
+            all = false;
         }
         Self { all, active }
     }
 
-    fn contains(&self, kind: MetadataColumnKind) -> bool {
-        self.all || self.active.contains(&kind)
+    fn contains(&self, column_name: &str) -> bool {
+        self.all || self.active.contains(column_name)
     }
 }
 
@@ -384,7 +371,7 @@ unsafe fn inspect_qual(
                 });
                 all_supported
             }
-            pg_sys::NodeTag::T_OpExpr => {
+            pg_sys::NodeTag::T_OpExpr
                 if inspect_op_expr(
                     node.cast(),
                     heap_relation,
@@ -392,15 +379,11 @@ unsafe fn inspect_qual(
                     schema,
                     active,
                     diagnostics,
-                ) {
-                    true
-                } else {
-                    collect_detected_columns(node, heap_relation, schema, diagnostics);
-                    diagnostics.record_unsupported();
-                    false
-                }
+                ) =>
+            {
+                true
             }
-            pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+            pg_sys::NodeTag::T_ScalarArrayOpExpr
                 if inspect_scalar_array_expr(
                     node.cast(),
                     heap_relation,
@@ -408,13 +391,9 @@ unsafe fn inspect_qual(
                     schema,
                     active,
                     diagnostics,
-                ) {
-                    true
-                } else {
-                    collect_detected_columns(node, heap_relation, schema, diagnostics);
-                    diagnostics.record_unsupported();
-                    false
-                }
+                ) =>
+            {
+                true
             }
             _ => {
                 collect_detected_columns(node, heap_relation, schema, diagnostics);
@@ -491,6 +470,9 @@ unsafe fn inspect_scalar_array_expr(
         if var.vartype != pg_sys::INT8OID {
             return false;
         }
+        if !var.semantics.supports(MetadataColumnOp::In) {
+            return false;
+        }
         let Some(values) = array_values_for_node(args[1], plan_state, &var.name) else {
             return false;
         };
@@ -507,8 +489,8 @@ unsafe fn inspect_scalar_array_expr(
             DetectedPredicate {
                 predicate: MetadataPredicate {
                     metadata_index: var.metadata_index,
-                    kind: var.kind,
                     column_name: var.name.clone(),
+                    exact: var.semantics.exact,
                     op: MetadataPredicateOp::In(values.values),
                 },
                 description: format!("{}=ANY({})", var.name, values.description),
@@ -524,7 +506,7 @@ fn record_detected(
     active: &MetadataActiveColumns,
     diagnostics: &mut QualDiagnostics,
 ) -> bool {
-    if !active.contains(detected.predicate.kind) {
+    if !active.contains(&detected.predicate.column_name) {
         return false;
     }
     diagnostics.record_supported(detected.predicate, detected.description);
@@ -603,7 +585,10 @@ unsafe fn planner_scalar_array_expr_is_coverable(
         let Some(var) = planner_metadata_var(args[0], index_info, schema) else {
             return false;
         };
-        if var.vartype != pg_sys::INT8OID || !active.contains(var.kind) {
+        if var.vartype != pg_sys::INT8OID
+            || !active.contains(&var.name)
+            || !var.semantics.supports(MetadataColumnOp::In)
+        {
             return false;
         }
         array_values_for_node(args[1], ptr::null_mut(), &var.name)
@@ -624,9 +609,12 @@ unsafe fn planner_binary_predicate_is_coverable(
         let Some(var) = planner_metadata_var(var_node, index_info, schema) else {
             return false;
         };
+        let Some(op) = int8_binary_op(expr) else {
+            return false;
+        };
         if var.vartype != pg_sys::INT8OID
-            || !active.contains(var.kind)
-            || int8_binary_op(expr).is_none()
+            || !active.contains(&var.name)
+            || !var.semantics.supports(metadata_op_for_binary_op(op))
         {
             return false;
         }
@@ -651,7 +639,8 @@ unsafe fn planner_bitmask_contains_is_coverable(
         let Some((var, mask)) = planner_int8_and(left, index_info, schema) else {
             return false;
         };
-        if !active.contains(var.kind) {
+        if !active.contains(&var.name) || !var.semantics.supports(MetadataColumnOp::BitmaskContains)
+        {
             return false;
         }
         let Some(expected) = scalar_value_for_node(right, ptr::null_mut(), &var.name) else {
@@ -740,6 +729,9 @@ unsafe fn inspect_binary_predicate(
             return None;
         }
         let op = int8_binary_op(expr)?;
+        if !var.semantics.supports(metadata_op_for_binary_op(op)) {
+            return None;
+        }
         let value = scalar_value_for_node(value_node, plan_state, &var.name)?;
         if value.unavailable_param {
             diagnostics.unavailable_param_count += 1;
@@ -754,8 +746,8 @@ unsafe fn inspect_binary_predicate(
         Some(DetectedPredicate {
             predicate: MetadataPredicate {
                 metadata_index: var.metadata_index,
-                kind: var.kind,
                 column_name: var.name.clone(),
+                exact: var.semantics.exact,
                 op: match op {
                     Int8BinaryOp::Eq => MetadataPredicateOp::Eq(target),
                     Int8BinaryOp::Ge => MetadataPredicateOp::Ge(target),
@@ -781,9 +773,10 @@ unsafe fn inspect_bitmask_contains(
         if int8_binary_op(expr)? != Int8BinaryOp::Eq {
             return None;
         }
-        let Some((var, mask)) = inspect_int8_and(left, heap_relation, plan_state, schema) else {
+        let (var, mask) = inspect_int8_and(left, heap_relation, plan_state, schema)?;
+        if !var.semantics.supports(MetadataColumnOp::BitmaskContains) {
             return None;
-        };
+        }
         let expected = scalar_value_for_node(right, plan_state, &var.name)?;
         if !expected.supported || expected.value? != mask {
             return None;
@@ -791,8 +784,8 @@ unsafe fn inspect_bitmask_contains(
         Some(DetectedPredicate {
             predicate: MetadataPredicate {
                 metadata_index: var.metadata_index,
-                kind: var.kind,
                 column_name: var.name.clone(),
+                exact: var.semantics.exact,
                 op: MetadataPredicateOp::BitmaskContains(mask),
             },
             description: format!("({}&{})={}", var.name, mask, mask),
@@ -1127,7 +1120,7 @@ unsafe fn external_param_count(plan_state: *mut pg_sys::PlanState) -> i32 {
 #[derive(Debug, Clone)]
 struct MetadataVar {
     name: String,
-    kind: MetadataColumnKind,
+    semantics: MetadataColumnSemantics,
     metadata_index: usize,
     vartype: pg_sys::Oid,
 }
@@ -1146,9 +1139,10 @@ unsafe fn metadata_var(
         let name = attname(heap_relation, var.varattno)
             .or_else(|| attname(heap_relation, var.varattnosyn))?;
         let column = schema.by_name(&name)?;
+        let semantics = column.semantics.clone()?;
         Some(MetadataVar {
             name,
-            kind: column.kind,
+            semantics,
             metadata_index: column.metadata_index,
             vartype: var.vartype,
         })
@@ -1182,9 +1176,10 @@ unsafe fn planner_metadata_var(
                 continue;
             }
             if var.varattno as i32 == heap_attno || var.varattnosyn as i32 == heap_attno {
+                let semantics = column.semantics.clone()?;
                 return Some(MetadataVar {
                     name: column.name.clone(),
-                    kind: column.kind,
+                    semantics,
                     metadata_index: column.metadata_index,
                     vartype: var.vartype,
                 });
@@ -1282,6 +1277,15 @@ impl Int8BinaryOp {
             Self::Gt => ">",
             Self::Le => "<=",
             Self::Lt => "<",
+        }
+    }
+}
+
+fn metadata_op_for_binary_op(op: Int8BinaryOp) -> MetadataColumnOp {
+    match op {
+        Int8BinaryOp::Eq => MetadataColumnOp::Eq,
+        Int8BinaryOp::Ge | Int8BinaryOp::Gt | Int8BinaryOp::Le | Int8BinaryOp::Lt => {
+            MetadataColumnOp::Range
         }
     }
 }
@@ -1385,6 +1389,7 @@ fn join_set(set: &BTreeSet<String>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::metadata::MetadataColumn;
     use super::*;
 
     fn metadata(values: &[(usize, i64)]) -> vchordrq::CandidateMetadata {
@@ -1395,40 +1400,114 @@ mod tests {
         metadata
     }
 
+    fn test_schema() -> MetadataSchema {
+        MetadataSchema::new_for_test(vec![
+            MetadataColumn {
+                name: "tenant_hash".to_owned(),
+                semantics: Some(MetadataColumnSemantics::new(
+                    [MetadataColumnOp::Eq, MetadataColumnOp::In],
+                    false,
+                )),
+                index_attno: 1,
+                metadata_index: 0,
+            },
+            MetadataColumn {
+                name: "state_code".to_owned(),
+                semantics: Some(MetadataColumnSemantics::new(
+                    [MetadataColumnOp::Eq, MetadataColumnOp::In],
+                    true,
+                )),
+                index_attno: 2,
+                metadata_index: 1,
+            },
+            MetadataColumn {
+                name: "created_bucket".to_owned(),
+                semantics: Some(MetadataColumnSemantics::new(
+                    [MetadataColumnOp::Range],
+                    false,
+                )),
+                index_attno: 3,
+                metadata_index: 2,
+            },
+            MetadataColumn {
+                name: "flags".to_owned(),
+                semantics: Some(MetadataColumnSemantics::new(
+                    [MetadataColumnOp::Eq, MetadataColumnOp::BitmaskContains],
+                    true,
+                )),
+                index_attno: 4,
+                metadata_index: 3,
+            },
+            MetadataColumn {
+                name: "undeclared_include".to_owned(),
+                semantics: None,
+                index_attno: 5,
+                metadata_index: 4,
+            },
+        ])
+    }
+
     fn predicate(
         metadata_index: usize,
-        kind: MetadataColumnKind,
+        column_name: &str,
+        exact: bool,
         op: MetadataPredicateOp,
     ) -> MetadataPredicate {
         MetadataPredicate {
             metadata_index,
-            kind,
-            column_name: kind.active_name().to_owned(),
+            column_name: column_name.to_owned(),
+            exact,
             op,
         }
     }
 
     #[test]
-    fn active_columns_parse_names_aliases_all_and_skip_bogus() {
-        let active = MetadataActiveColumns::parse(
-            "feed, eligibility_flags_meta, status_meta, bogus, geo, created_at_bucket_meta",
-        );
-        assert!(active.contains(MetadataColumnKind::Feed));
-        assert!(active.contains(MetadataColumnKind::Flags));
-        assert!(active.contains(MetadataColumnKind::Status));
-        assert!(active.contains(MetadataColumnKind::Geo));
-        assert!(active.contains(MetadataColumnKind::Time));
-        assert!(!active.contains(MetadataColumnKind::Deleted));
-        assert!(!active.contains(MetadataColumnKind::Visibility));
+    fn active_columns_parse_exact_names_all_and_skip_bogus() {
+        let schema = test_schema();
+        let active = MetadataActiveColumns::parse("tenant_hash, bogus, state_code", &schema);
+        assert!(active.contains("tenant_hash"));
+        assert!(active.contains("state_code"));
+        assert!(!active.contains("flags"));
+        assert!(!active.contains("bogus"));
 
-        let all = MetadataActiveColumns::parse("all");
-        assert!(all.contains(MetadataColumnKind::Feed));
-        assert!(all.contains(MetadataColumnKind::Flags));
-        assert!(all.contains(MetadataColumnKind::Status));
-        assert!(all.contains(MetadataColumnKind::Deleted));
-        assert!(all.contains(MetadataColumnKind::Visibility));
-        assert!(all.contains(MetadataColumnKind::Geo));
-        assert!(all.contains(MetadataColumnKind::Time));
+        let all = MetadataActiveColumns::parse("", &schema);
+        assert!(all.contains("tenant_hash"));
+        assert!(all.contains("state_code"));
+        assert!(all.contains("created_bucket"));
+        assert!(all.contains("flags"));
+        assert!(!all.contains("undeclared_include"));
+
+        let retired_aliases = MetadataActiveColumns::parse("feed,geo,time", &schema);
+        assert!(!retired_aliases.contains("tenant_hash"));
+        assert!(!retired_aliases.contains("created_bucket"));
+    }
+
+    #[test]
+    fn declared_semantics_gate_predicate_shapes() {
+        let schema = test_schema();
+        let tenant = schema
+            .declared_by_name("tenant_hash")
+            .and_then(|column| column.semantics.as_ref())
+            .unwrap();
+        assert!(tenant.supports(MetadataColumnOp::Eq));
+        assert!(tenant.supports(MetadataColumnOp::In));
+        assert!(!tenant.supports(MetadataColumnOp::Range));
+        assert!(!tenant.supports(MetadataColumnOp::BitmaskContains));
+
+        let created = schema
+            .declared_by_name("created_bucket")
+            .and_then(|column| column.semantics.as_ref())
+            .unwrap();
+        assert!(created.supports(MetadataColumnOp::Range));
+        assert!(!created.supports(MetadataColumnOp::Eq));
+
+        let flags = schema
+            .declared_by_name("flags")
+            .and_then(|column| column.semantics.as_ref())
+            .unwrap();
+        assert!(flags.supports(MetadataColumnOp::Eq));
+        assert!(flags.supports(MetadataColumnOp::BitmaskContains));
+        assert!(!flags.supports(MetadataColumnOp::Range));
     }
 
     #[test]
@@ -1436,35 +1515,41 @@ mod tests {
         let candidate = metadata(&[(0, 42), (1, 7), (2, 11), (3, 0b1011)]);
 
         assert_eq!(
-            predicate(0, MetadataColumnKind::Feed, MetadataPredicateOp::Eq(42))
+            predicate(0, "tenant_hash", false, MetadataPredicateOp::Eq(42))
                 .is_definitely_false(candidate),
             Some(false)
         );
         assert_eq!(
-            predicate(0, MetadataColumnKind::Feed, MetadataPredicateOp::Eq(43))
+            predicate(0, "tenant_hash", false, MetadataPredicateOp::Eq(43))
                 .is_definitely_false(candidate),
             Some(true)
         );
         assert_eq!(
-            predicate(1, MetadataColumnKind::Status, MetadataPredicateOp::In(vec![3, 7, 9]))
-                .is_definitely_false(candidate),
+            predicate(
+                1,
+                "state_code",
+                true,
+                MetadataPredicateOp::In(vec![3, 7, 9]),
+            )
+            .is_definitely_false(candidate),
             Some(false)
         );
         assert_eq!(
-            predicate(2, MetadataColumnKind::Time, MetadataPredicateOp::Ge(12))
+            predicate(2, "created_bucket", false, MetadataPredicateOp::Ge(12))
                 .is_definitely_false(candidate),
             Some(true)
         );
         assert_eq!(
-            predicate(2, MetadataColumnKind::Time, MetadataPredicateOp::Lt(12))
+            predicate(2, "created_bucket", false, MetadataPredicateOp::Lt(12))
                 .is_definitely_false(candidate),
             Some(false)
         );
         assert_eq!(
             predicate(
                 3,
-                MetadataColumnKind::Flags,
-                MetadataPredicateOp::BitmaskContains(0b0011),
+                "flags",
+                true,
+                MetadataPredicateOp::BitmaskContains(0b0011)
             )
             .is_definitely_false(candidate),
             Some(false)
@@ -1472,8 +1557,9 @@ mod tests {
         assert_eq!(
             predicate(
                 3,
-                MetadataColumnKind::Flags,
-                MetadataPredicateOp::BitmaskContains(0b0100),
+                "flags",
+                true,
+                MetadataPredicateOp::BitmaskContains(0b0100)
             )
             .is_definitely_false(candidate),
             Some(true)
@@ -1484,41 +1570,19 @@ mod tests {
     fn missing_metadata_is_maybe_not_false() {
         let candidate = metadata(&[(0, 42)]);
         assert_eq!(
-            predicate(1, MetadataColumnKind::Geo, MetadataPredicateOp::Eq(9))
+            predicate(1, "state_code", true, MetadataPredicateOp::Eq(9))
                 .is_definitely_false(candidate),
             None
         );
     }
 
     #[test]
-    fn only_exact_status_like_predicates_can_skip_heap_recheck() {
+    fn exact_flag_controls_heap_recheck_skip() {
         assert!(
-            predicate(1, MetadataColumnKind::Flags, MetadataPredicateOp::Eq(1))
-                .is_exact_for_heap_skip()
+            predicate(1, "any_name", true, MetadataPredicateOp::Eq(1)).is_exact_for_heap_skip()
         );
         assert!(
-            predicate(2, MetadataColumnKind::Status, MetadataPredicateOp::Eq(1))
-                .is_exact_for_heap_skip()
-        );
-        assert!(
-            predicate(3, MetadataColumnKind::Deleted, MetadataPredicateOp::Eq(0))
-                .is_exact_for_heap_skip()
-        );
-        assert!(
-            predicate(4, MetadataColumnKind::Visibility, MetadataPredicateOp::Eq(1))
-                .is_exact_for_heap_skip()
-        );
-        assert!(
-            !predicate(0, MetadataColumnKind::Feed, MetadataPredicateOp::Eq(1))
-                .is_exact_for_heap_skip()
-        );
-        assert!(
-            !predicate(5, MetadataColumnKind::Geo, MetadataPredicateOp::Eq(1))
-                .is_exact_for_heap_skip()
-        );
-        assert!(
-            !predicate(6, MetadataColumnKind::Time, MetadataPredicateOp::Ge(1))
-                .is_exact_for_heap_skip()
+            !predicate(1, "any_name", false, MetadataPredicateOp::Eq(1)).is_exact_for_heap_skip()
         );
     }
 
@@ -1527,8 +1591,8 @@ mod tests {
         let mut diagnostics = QualDiagnostics::default();
         diagnostics.top_level_qual_count = 2;
         diagnostics.record_supported(
-            predicate(1, MetadataColumnKind::Status, MetadataPredicateOp::Eq(3)),
-            "status_meta=const(3)".to_owned(),
+            predicate(1, "state_code", true, MetadataPredicateOp::Eq(3)),
+            "state_code=const(3)".to_owned(),
         );
         diagnostics.record_unsupported();
         diagnostics.unavailable_param_count = 1;
@@ -1542,8 +1606,8 @@ mod tests {
         let mut covered = QualDiagnostics::default();
         covered.top_level_qual_count = 1;
         covered.record_supported(
-            predicate(6, MetadataColumnKind::Time, MetadataPredicateOp::Ge(100)),
-            "created_at_bucket_meta>=const(100)".to_owned(),
+            predicate(2, "created_bucket", false, MetadataPredicateOp::Ge(100)),
+            "created_bucket>=const(100)".to_owned(),
         );
         assert!(covered.compiled().all_quals_covered);
     }

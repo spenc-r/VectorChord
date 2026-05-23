@@ -387,8 +387,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             // by `node_count` so the estimate cannot exceed the candidates
             // the IVF visits at the configured probe count.
             let next_count = if (*root).limit_tuples > 0.0 {
-                ((*root).limit_tuples * f64::min(1000.0, 1.0 / filter_selectivity))
-                    .min(node_count)
+                ((*root).limit_tuples * f64::min(1000.0, 1.0 / filter_selectivity)).min(node_count)
             } else {
                 node_count
             };
@@ -401,6 +400,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 let schema = metadata::detect_schema(relation.raw());
                 let active = metadata_qual::MetadataActiveColumns::parse(
                     &gucs::vchordrq_metadata_active_columns(),
+                    &schema,
                 );
                 if let Some(metadata_cost) =
                     metadata_qual::planner_metadata_cost(root, path, &schema, &active)
@@ -593,8 +593,10 @@ pub unsafe extern "C-unwind" fn amrescan(
         let prefilter_window = 0;
         let vector_read_window = 0;
         let metadata_schema = metadata::detect_schema((*scan).indexRelation);
-        let metadata_active_columns =
-            metadata_qual::MetadataActiveColumns::parse(&gucs::vchordrq_metadata_active_columns());
+        let metadata_active_columns = metadata_qual::MetadataActiveColumns::parse(
+            &gucs::vchordrq_metadata_active_columns(),
+            &metadata_schema,
+        );
         let compiled_metadata_qual = metadata_qual::compile_scan_qual(
             scan,
             scanner.hack,
@@ -605,7 +607,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             scan,
             scanner.hack,
             &metadata_schema,
-            &metadata_qual::MetadataActiveColumns::parse("all"),
+            &metadata_qual::MetadataActiveColumns::parse("all", &metadata_schema),
         );
         let metadata_prefilter = MetadataPrefilterOptions {
             mode: gucs::vchordrq_metadata_prefilter(),
@@ -848,10 +850,7 @@ metadata_supported_qual_count={} metadata_unsupported_qual_count={} \
 metadata_all_quals_covered={} metadata_unavailable_param_count={} \
 metadata_checked={} metadata_rejected={} metadata_survived={} \
 metadata_true={} metadata_maybe={} \
-metadata_rejected_by_feed={} metadata_rejected_by_flags={} \
-metadata_rejected_by_status={} metadata_rejected_by_deleted={} \
-metadata_rejected_by_visibility={} metadata_rejected_by_geo={} \
-metadata_rejected_by_time={} \
+metadata_rejected_by_columns={} \
 metadata_false_negative_debug={} \
 heap_prefilter_after_metadata={} heap_prefilter_avoided={} \
 prefilter_checked={} prefilter_passed={} \
@@ -875,13 +874,7 @@ metadata_eval_ms={:.3} total_scan_ms={:.3}",
             snapshot.metadata_survived_count,
             snapshot.metadata_true_count,
             snapshot.metadata_maybe_count,
-            snapshot.metadata_rejected_by_feed_count,
-            snapshot.metadata_rejected_by_flags_count,
-            snapshot.metadata_rejected_by_status_count,
-            snapshot.metadata_rejected_by_deleted_count,
-            snapshot.metadata_rejected_by_visibility_count,
-            snapshot.metadata_rejected_by_geo_count,
-            snapshot.metadata_rejected_by_time_count,
+            snapshot.metadata_rejected_by_columns,
             snapshot.metadata_false_negative_count_debug,
             snapshot.heap_prefilter_after_metadata_count,
             snapshot.heap_prefilter_avoided_count,

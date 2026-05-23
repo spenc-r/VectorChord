@@ -36,9 +36,9 @@ VECTOR_DIM = 128
 QUERY = f"""
 SELECT id
 FROM metadata_prefilter_smoke
-WHERE feed_id_meta_hash = hashtextextended('feed-10', 0)
-  AND status_meta = 0
-  AND deleted_meta = 0
+WHERE tenant_hash = hashtextextended('feed-10', 0)
+  AND state_code = 0
+  AND deletion_marker = 0
 ORDER BY v <-> ('[' || array_to_string(array_fill(0.13::real, ARRAY[{VECTOR_DIM}]), ',') || ']')::vector
 LIMIT 50
 """
@@ -52,7 +52,7 @@ def configure_prefilter(cur: psycopg.Cursor, mode: str, debug: bool = False) -> 
     cur.execute(f"SET vchordrq.metadata_prefilter = {mode}")
     cur.execute(
         "SET vchordrq.metadata_active_columns = "
-        "'feed,flags,status,deleted,visibility,geo,time'"
+        "'tenant_hash,state_code,deletion_marker'"
     )
     cur.execute(f"SET vchordrq.metadata_prefilter_debug = {'on' if debug else 'off'}")
 
@@ -108,13 +108,13 @@ def main() -> None:
                 f"""
                 CREATE TABLE metadata_prefilter_smoke (
                   id int PRIMARY KEY,
-                  feed_id_meta_hash bigint,
-                  status_meta bigint,
-                  visibility_meta bigint,
-                  deleted_meta bigint,
-                  eligibility_flags_meta bigint,
-                  geo_cell_meta bigint,
-                  created_at_bucket_meta bigint,
+                  tenant_hash bigint,
+                  state_code bigint,
+                  visibility_code bigint,
+                  deletion_marker bigint,
+                  flag_bits bigint,
+                  geo_token bigint,
+                  time_bucket bigint,
                   v vector({VECTOR_DIM}) NOT NULL
                 )
                 """
@@ -146,17 +146,27 @@ def main() -> None:
                 ON metadata_prefilter_smoke
                 USING vchordrq (v vector_l2_ops)
                 INCLUDE (
-                  feed_id_meta_hash,
-                  status_meta,
-                  visibility_meta,
-                  deleted_meta,
-                  eligibility_flags_meta,
-                  geo_cell_meta,
-                  created_at_bucket_meta
+                  tenant_hash,
+                  state_code,
+                  visibility_code,
+                  deletion_marker,
+                  flag_bits,
+                  geo_token,
+                  time_bucket
                 )
                 WITH (options = $$
                 residual_quantization = false
                 rerank_in_table = false
+                [metadata]
+                columns = [
+                  { name = "tenant_hash", ops = ["eq", "in"], exact = false },
+                  { name = "state_code", ops = ["eq", "in"], exact = true },
+                  { name = "visibility_code", ops = ["eq"], exact = true },
+                  { name = "deletion_marker", ops = ["eq"], exact = true },
+                  { name = "flag_bits", ops = ["eq", "bitmask_contains"], exact = true },
+                  { name = "geo_token", ops = ["eq", "in", "range"], exact = false },
+                  { name = "time_bucket", ops = ["range"], exact = false },
+                ]
                 [build.internal]
                 lists = []
                 $$)
@@ -165,7 +175,7 @@ def main() -> None:
             cur.execute("ANALYZE metadata_prefilter_smoke")
             cur.execute(
                 "CREATE INDEX metadata_prefilter_smoke_filter_idx "
-                "ON metadata_prefilter_smoke (feed_id_meta_hash, status_meta, deleted_meta)"
+                "ON metadata_prefilter_smoke (tenant_hash, state_code, deletion_marker)"
             )
             cur.execute("ANALYZE metadata_prefilter_smoke")
 
@@ -211,6 +221,7 @@ def main() -> None:
             for required in (
                 "metadata_checked",
                 "metadata_rejected",
+                "metadata_rejected_by_columns",
                 "metadata_false_negative_debug",
                 "metadata_prefilter_mode",
             ):
@@ -228,6 +239,10 @@ def main() -> None:
                 raise AssertionError(
                     f"reject_only mode should have rejected candidates: {debug_notices[0]!r}"
                 )
+            if counters["metadata_rejected_by_columns"] == "none":
+                raise AssertionError(
+                    f"reject_only mode should report reject columns: {debug_notices[0]!r}"
+                )
             if int(counters["metadata_false_negative_debug"]) != 0:
                 raise AssertionError(
                     f"debug verification surfaced a false-negative reject: "
@@ -242,9 +257,9 @@ def main() -> None:
                 SELECT count(*)
                 FROM metadata_prefilter_smoke
                 WHERE NOT (
-                  feed_id_meta_hash = hashtextextended('feed-10', 0)
-                  AND status_meta = 0
-                  AND deleted_meta = 0
+                  tenant_hash = hashtextextended('feed-10', 0)
+                  AND state_code = 0
+                  AND deletion_marker = 0
                 )
                 """
             )

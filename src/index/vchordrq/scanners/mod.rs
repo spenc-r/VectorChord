@@ -17,9 +17,9 @@ mod maxsim;
 
 use crate::index::gucs::MetadataPrefilterMode;
 use crate::index::scanners::Io;
-use crate::index::vchordrq::am::metadata::MetadataColumnKind;
 use crate::index::vchordrq::am::metadata_qual::MetadataPredicate;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -45,26 +45,11 @@ struct SearchInstrumentationInner {
     metadata_survived_count: Cell<usize>,
     metadata_true_count: Cell<usize>,
     metadata_maybe_count: Cell<usize>,
-    metadata_rejected_by_feed_count: Cell<usize>,
-    metadata_rejected_by_flags_count: Cell<usize>,
-    metadata_rejected_by_status_count: Cell<usize>,
-    metadata_rejected_by_deleted_count: Cell<usize>,
-    metadata_rejected_by_visibility_count: Cell<usize>,
-    metadata_rejected_by_geo_count: Cell<usize>,
-    metadata_rejected_by_time_count: Cell<usize>,
+    metadata_rejected_by_columns: RefCell<BTreeMap<String, usize>>,
     residual_checked_count: Cell<usize>,
     residual_passed_count: Cell<usize>,
     residual_failed_count: Cell<usize>,
-    hypothetical_reject_feed_count: Cell<usize>,
-    hypothetical_reject_flags_count: Cell<usize>,
-    hypothetical_reject_status_count: Cell<usize>,
-    hypothetical_reject_deleted_count: Cell<usize>,
-    hypothetical_reject_visibility_count: Cell<usize>,
-    hypothetical_reject_geo_count: Cell<usize>,
-    hypothetical_reject_time_count: Cell<usize>,
-    hypothetical_reject_feed_flags_count: Cell<usize>,
-    hypothetical_reject_feed_flags_geo_count: Cell<usize>,
-    hypothetical_reject_feed_flags_geo_time_count: Cell<usize>,
+    hypothetical_rejected_by_columns: RefCell<BTreeMap<String, usize>>,
     metadata_eval_ns: Cell<u128>,
     metadata_decode_ns: Cell<u128>,
     metadata_supported_qual_count: Cell<usize>,
@@ -87,7 +72,7 @@ struct SearchInstrumentationInner {
 // instrumentation surfaces (streaming-IO / per-stage breakdown) without
 // re-threading the snapshot wiring.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SearchInstrumentationSnapshot {
     pub candidate_count: usize,
     pub candidate_count_before_block_prune: usize,
@@ -102,26 +87,11 @@ pub struct SearchInstrumentationSnapshot {
     pub metadata_survived_count: usize,
     pub metadata_true_count: usize,
     pub metadata_maybe_count: usize,
-    pub metadata_rejected_by_feed_count: usize,
-    pub metadata_rejected_by_flags_count: usize,
-    pub metadata_rejected_by_status_count: usize,
-    pub metadata_rejected_by_deleted_count: usize,
-    pub metadata_rejected_by_visibility_count: usize,
-    pub metadata_rejected_by_geo_count: usize,
-    pub metadata_rejected_by_time_count: usize,
+    pub metadata_rejected_by_columns: String,
     pub residual_checked_count: usize,
     pub residual_passed_count: usize,
     pub residual_failed_count: usize,
-    pub hypothetical_reject_feed_count: usize,
-    pub hypothetical_reject_flags_count: usize,
-    pub hypothetical_reject_status_count: usize,
-    pub hypothetical_reject_deleted_count: usize,
-    pub hypothetical_reject_visibility_count: usize,
-    pub hypothetical_reject_geo_count: usize,
-    pub hypothetical_reject_time_count: usize,
-    pub hypothetical_reject_feed_flags_count: usize,
-    pub hypothetical_reject_feed_flags_geo_count: usize,
-    pub hypothetical_reject_feed_flags_geo_time_count: usize,
+    pub hypothetical_rejected_by_columns: String,
     pub metadata_eval_ns: u128,
     pub metadata_decode_ns: u128,
     pub metadata_supported_qual_count: usize,
@@ -157,6 +127,24 @@ pub struct SearchInstrumentationSnapshot {
     pub vector_window_unique_pages: usize,
 }
 
+fn increment_column_count(counts: &RefCell<BTreeMap<String, usize>>, column_name: &str) {
+    let mut counts = counts.borrow_mut();
+    *counts.entry(column_name.to_owned()).or_insert(0) += 1;
+}
+
+fn format_column_counts(counts: &RefCell<BTreeMap<String, usize>>) -> String {
+    let counts = counts.borrow();
+    if counts.is_empty() {
+        "none".to_owned()
+    } else {
+        counts
+            .iter()
+            .map(|(column, count)| format!("{column}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 impl SearchInstrumentation {
     pub fn new() -> Self {
         Self {
@@ -173,26 +161,11 @@ impl SearchInstrumentation {
                 metadata_survived_count: Cell::new(0),
                 metadata_true_count: Cell::new(0),
                 metadata_maybe_count: Cell::new(0),
-                metadata_rejected_by_feed_count: Cell::new(0),
-                metadata_rejected_by_flags_count: Cell::new(0),
-                metadata_rejected_by_status_count: Cell::new(0),
-                metadata_rejected_by_deleted_count: Cell::new(0),
-                metadata_rejected_by_visibility_count: Cell::new(0),
-                metadata_rejected_by_geo_count: Cell::new(0),
-                metadata_rejected_by_time_count: Cell::new(0),
+                metadata_rejected_by_columns: RefCell::new(BTreeMap::new()),
                 residual_checked_count: Cell::new(0),
                 residual_passed_count: Cell::new(0),
                 residual_failed_count: Cell::new(0),
-                hypothetical_reject_feed_count: Cell::new(0),
-                hypothetical_reject_flags_count: Cell::new(0),
-                hypothetical_reject_status_count: Cell::new(0),
-                hypothetical_reject_deleted_count: Cell::new(0),
-                hypothetical_reject_visibility_count: Cell::new(0),
-                hypothetical_reject_geo_count: Cell::new(0),
-                hypothetical_reject_time_count: Cell::new(0),
-                hypothetical_reject_feed_flags_count: Cell::new(0),
-                hypothetical_reject_feed_flags_geo_count: Cell::new(0),
-                hypothetical_reject_feed_flags_geo_time_count: Cell::new(0),
+                hypothetical_rejected_by_columns: RefCell::new(BTreeMap::new()),
                 metadata_eval_ns: Cell::new(0),
                 metadata_decode_ns: Cell::new(0),
                 metadata_supported_qual_count: Cell::new(0),
@@ -282,18 +255,8 @@ impl SearchInstrumentation {
             .set(self.inner.metadata_rejected_count.get() + 1);
     }
 
-    pub fn increment_metadata_rejected_by(&self, kind: MetadataColumnKind) {
-        let counter = match kind {
-            MetadataColumnKind::Feed => &self.inner.metadata_rejected_by_feed_count,
-            MetadataColumnKind::Flags => &self.inner.metadata_rejected_by_flags_count,
-            MetadataColumnKind::Status => &self.inner.metadata_rejected_by_status_count,
-            MetadataColumnKind::Deleted => &self.inner.metadata_rejected_by_deleted_count,
-            MetadataColumnKind::Visibility => &self.inner.metadata_rejected_by_visibility_count,
-            MetadataColumnKind::Geo => &self.inner.metadata_rejected_by_geo_count,
-            MetadataColumnKind::Time => &self.inner.metadata_rejected_by_time_count,
-            MetadataColumnKind::Other => return,
-        };
-        counter.set(counter.get() + 1);
+    pub fn increment_metadata_rejected_by(&self, column_name: &str) {
+        increment_column_count(&self.inner.metadata_rejected_by_columns, column_name);
     }
 
     pub fn increment_metadata_survived(&self) {
@@ -374,41 +337,8 @@ impl SearchInstrumentation {
         }
     }
 
-    pub fn increment_hypothetical_reject_by(&self, kind: MetadataColumnKind) {
-        let counter = match kind {
-            MetadataColumnKind::Feed => &self.inner.hypothetical_reject_feed_count,
-            MetadataColumnKind::Flags => &self.inner.hypothetical_reject_flags_count,
-            MetadataColumnKind::Status => &self.inner.hypothetical_reject_status_count,
-            MetadataColumnKind::Deleted => &self.inner.hypothetical_reject_deleted_count,
-            MetadataColumnKind::Visibility => &self.inner.hypothetical_reject_visibility_count,
-            MetadataColumnKind::Geo => &self.inner.hypothetical_reject_geo_count,
-            MetadataColumnKind::Time => &self.inner.hypothetical_reject_time_count,
-            MetadataColumnKind::Other => return,
-        };
-        counter.set(counter.get() + 1);
-    }
-
-    pub fn increment_hypothetical_feed_flags(&self) {
-        self.inner
-            .hypothetical_reject_feed_flags_count
-            .set(self.inner.hypothetical_reject_feed_flags_count.get() + 1);
-    }
-
-    pub fn increment_hypothetical_feed_flags_geo(&self) {
-        self.inner
-            .hypothetical_reject_feed_flags_geo_count
-            .set(self.inner.hypothetical_reject_feed_flags_geo_count.get() + 1);
-    }
-
-    pub fn increment_hypothetical_feed_flags_geo_time(&self) {
-        self.inner
-            .hypothetical_reject_feed_flags_geo_time_count
-            .set(
-                self.inner
-                    .hypothetical_reject_feed_flags_geo_time_count
-                    .get()
-                    + 1,
-            );
+    pub fn increment_hypothetical_reject_by(&self, column_name: &str) {
+        increment_column_count(&self.inner.hypothetical_rejected_by_columns, column_name);
     }
 
     pub fn add_prefilter_fetch_time(&self, duration: Duration) {
@@ -465,41 +395,15 @@ impl SearchInstrumentation {
             metadata_survived_count: self.inner.metadata_survived_count.get(),
             metadata_true_count: self.inner.metadata_true_count.get(),
             metadata_maybe_count: self.inner.metadata_maybe_count.get(),
-            metadata_rejected_by_feed_count: self.inner.metadata_rejected_by_feed_count.get(),
-            metadata_rejected_by_flags_count: self.inner.metadata_rejected_by_flags_count.get(),
-            metadata_rejected_by_status_count: self.inner.metadata_rejected_by_status_count.get(),
-            metadata_rejected_by_deleted_count: self.inner.metadata_rejected_by_deleted_count.get(),
-            metadata_rejected_by_visibility_count: self
-                .inner
-                .metadata_rejected_by_visibility_count
-                .get(),
-            metadata_rejected_by_geo_count: self.inner.metadata_rejected_by_geo_count.get(),
-            metadata_rejected_by_time_count: self.inner.metadata_rejected_by_time_count.get(),
+            metadata_rejected_by_columns: format_column_counts(
+                &self.inner.metadata_rejected_by_columns,
+            ),
             residual_checked_count: self.inner.residual_checked_count.get(),
             residual_passed_count: self.inner.residual_passed_count.get(),
             residual_failed_count: self.inner.residual_failed_count.get(),
-            hypothetical_reject_feed_count: self.inner.hypothetical_reject_feed_count.get(),
-            hypothetical_reject_flags_count: self.inner.hypothetical_reject_flags_count.get(),
-            hypothetical_reject_status_count: self.inner.hypothetical_reject_status_count.get(),
-            hypothetical_reject_deleted_count: self.inner.hypothetical_reject_deleted_count.get(),
-            hypothetical_reject_visibility_count: self
-                .inner
-                .hypothetical_reject_visibility_count
-                .get(),
-            hypothetical_reject_geo_count: self.inner.hypothetical_reject_geo_count.get(),
-            hypothetical_reject_time_count: self.inner.hypothetical_reject_time_count.get(),
-            hypothetical_reject_feed_flags_count: self
-                .inner
-                .hypothetical_reject_feed_flags_count
-                .get(),
-            hypothetical_reject_feed_flags_geo_count: self
-                .inner
-                .hypothetical_reject_feed_flags_geo_count
-                .get(),
-            hypothetical_reject_feed_flags_geo_time_count: self
-                .inner
-                .hypothetical_reject_feed_flags_geo_time_count
-                .get(),
+            hypothetical_rejected_by_columns: format_column_counts(
+                &self.inner.hypothetical_rejected_by_columns,
+            ),
             metadata_eval_ns: self.inner.metadata_eval_ns.get(),
             metadata_decode_ns: self.inner.metadata_decode_ns.get(),
             metadata_supported_qual_count: self.inner.metadata_supported_qual_count.get(),

@@ -16,7 +16,6 @@ use crate::index::fetcher::*;
 use crate::index::gucs::MetadataPrefilterMode;
 use crate::index::opclass::Sphere;
 use crate::index::scanners::{Io, SearchBuilder};
-use crate::index::vchordrq::am::metadata::MetadataColumnKind;
 use crate::index::vchordrq::dispatch::*;
 use crate::index::vchordrq::filter::{HeapBlockKey, WindowFilterStats, window_filter};
 use crate::index::vchordrq::opclass::Opfamily;
@@ -26,8 +25,8 @@ use crate::index::vchordrq::scanners::{
 use crate::recorder::{Recorder, text};
 use always_equal::AlwaysEqual;
 use dary_heap::QuaternaryHeap as Heap;
-use index::accessor::{Dot, L2S};
 use distance::Distance;
+use index::accessor::{Dot, L2S};
 use index::bump::Bump;
 use index::fetch::BorrowedIter;
 use index::packed::{PackedRefMut, PackedRefMut4};
@@ -146,10 +145,10 @@ fn block_summary_rejects(
 fn candidate_metadata_definitely_rejected(
     candidate_metadata: CandidateMetadata,
     predicates: &[crate::index::vchordrq::am::metadata_qual::MetadataPredicate],
-) -> Option<MetadataColumnKind> {
+) -> Option<&str> {
     for predicate in predicates {
         match predicate.is_definitely_false(candidate_metadata) {
-            Some(true) => return Some(predicate.kind),
+            Some(true) => return Some(&predicate.column_name),
             Some(false) => {}
             None => return None,
         }
@@ -179,7 +178,7 @@ fn metadata_candidate_allows(
     for predicate in &metadata_prefilter.predicates {
         match predicate.is_definitely_false(candidate_metadata) {
             Some(true) => {
-                rejected_by = Some(predicate.kind);
+                rejected_by = Some(predicate.column_name.as_str());
                 break;
             }
             Some(false) => {}
@@ -216,8 +215,8 @@ fn metadata_candidate_allows(
                 instrumentation.increment_metadata_false_negative_debug();
             }
             pgrx::error!(
-                "vchordrq metadata prefilter false negative for kind={}",
-                rejected_by.active_name()
+                "vchordrq metadata prefilter false negative for column={}",
+                rejected_by
             );
         }
     }
@@ -299,32 +298,13 @@ fn record_hypothetical_rejects(
     predicates: &[crate::index::vchordrq::am::metadata_qual::MetadataPredicate],
     instrumentation: &SearchInstrumentation,
 ) {
-    let mut rejected = std::collections::BTreeSet::new();
     for predicate in predicates {
         if predicate
             .is_definitely_false(candidate_metadata)
             .unwrap_or(false)
         {
-            rejected.insert(predicate.kind);
-            instrumentation.increment_hypothetical_reject_by(predicate.kind);
+            instrumentation.increment_hypothetical_reject_by(&predicate.column_name);
         }
-    }
-    let feed_flags = rejected.contains(&MetadataColumnKind::Feed)
-        || rejected.contains(&MetadataColumnKind::Flags)
-        || rejected.contains(&MetadataColumnKind::Status)
-        || rejected.contains(&MetadataColumnKind::Deleted)
-        || rejected.contains(&MetadataColumnKind::Visibility);
-    if feed_flags {
-        instrumentation.increment_hypothetical_feed_flags();
-    }
-    if feed_flags || rejected.contains(&MetadataColumnKind::Geo) {
-        instrumentation.increment_hypothetical_feed_flags_geo();
-    }
-    if feed_flags
-        || rejected.contains(&MetadataColumnKind::Geo)
-        || rejected.contains(&MetadataColumnKind::Time)
-    {
-        instrumentation.increment_hypothetical_feed_flags_geo_time();
     }
 }
 

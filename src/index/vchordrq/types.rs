@@ -13,6 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use validator::{Validate, ValidationError, ValidationErrors};
 use vchordrq::types::VchordrqIndexOptions;
 
@@ -205,6 +206,47 @@ impl VchordrqBuildOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VchordrqMetadataColumnOp {
+    Eq,
+    In,
+    Range,
+    BitmaskContains,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct VchordrqMetadataColumnOptions {
+    #[validate(length(min = 1))]
+    pub name: String,
+    #[validate(length(min = 1))]
+    pub ops: Vec<VchordrqMetadataColumnOp>,
+    #[serde(default)]
+    pub exact: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct VchordrqMetadataOptions {
+    #[serde(default)]
+    #[validate(nested)]
+    #[validate(custom(function = VchordrqMetadataOptions::validate_columns))]
+    pub columns: Vec<VchordrqMetadataColumnOptions>,
+}
+
+impl VchordrqMetadataOptions {
+    fn validate_columns(columns: &[VchordrqMetadataColumnOptions]) -> Result<(), ValidationError> {
+        let mut seen = BTreeSet::new();
+        for column in columns {
+            if !seen.insert(column.name.as_str()) {
+                return Err(ValidationError::new("metadata column names must be unique"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct VchordrqIndexingOptions {
@@ -214,4 +256,7 @@ pub struct VchordrqIndexingOptions {
     #[serde(default)]
     #[validate(nested)]
     pub build: VchordrqBuildOptions,
+    #[serde(default)]
+    #[validate(nested)]
+    pub metadata: VchordrqMetadataOptions,
 }
