@@ -58,6 +58,18 @@ ORDER BY v <-> ('[' || array_to_string(array_fill(0.13::real, ARRAY[{VECTOR_DIM}
 LIMIT 50
 """
 
+PREPARED_CLIFF_QUERY = f"""
+SELECT id
+FROM metadata_prefilter_smoke
+WHERE tenant_hash = hashtextextended('feed-10', 0)
+  AND state_code = %(state)s::bigint
+  AND deletion_marker = %(deleted)s::bigint
+  AND (flag_bits & %(mask)s::bigint) = %(mask)s::bigint
+  AND geo_token = ANY(%(geo)s::bigint[])
+ORDER BY v <-> ('[' || array_to_string(array_fill(0.13::real, ARRAY[{VECTOR_DIM}]), ',') || ']')::vector
+LIMIT 20
+"""
+
 
 def configure_prefilter(cur: psycopg.Cursor, mode: str, debug: bool = False) -> None:
     cur.execute("SET enable_seqscan = off")
@@ -155,6 +167,59 @@ def assert_generic_param_metadata_quals(
     cur.execute("RESET client_min_messages")
 
 
+def prepared_latency_median(dsn: str, prepare_threshold: int | None) -> tuple[float, int]:
+    params = {
+        "state": 0,
+        "deleted": 0,
+        "mask": 3,
+        "geo": [10, 110, 210, 310, 410],
+    }
+    timings = []
+    row_count: int | None = None
+    generic_plans = 0
+    with psycopg.connect(
+        dsn, autocommit=True, prepare_threshold=prepare_threshold
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET enable_seqscan = off")
+            cur.execute("SET enable_bitmapscan = off")
+            cur.execute("SET plan_cache_mode = auto")
+            cur.execute("SET vchordrq.prefilter = on")
+            cur.execute("SET vchordrq.metadata_prefilter = reject_only")
+            cur.execute(
+                "SET vchordrq.metadata_active_columns = "
+                "'tenant_hash,state_code,deletion_marker,flag_bits,geo_token'"
+            )
+            for _ in range(20):
+                started = time.perf_counter()
+                cur.execute(PREPARED_CLIFF_QUERY, params)
+                rows = cur.fetchall()
+                timings.append(time.perf_counter() - started)
+                if row_count is None:
+                    row_count = len(rows)
+                elif row_count != len(rows):
+                    raise AssertionError("prepared latency check returned unstable row counts")
+            cur.execute("SELECT coalesce(sum(generic_plans), 0) FROM pg_prepared_statements")
+            generic_plans = int(cur.fetchone()[0])
+    if row_count is None or row_count == 0:
+        raise AssertionError("prepared latency check needs non-empty result rows")
+    return statistics.median(timings[10:]), generic_plans
+
+
+def assert_prepared_latency_no_cliff(dsn: str) -> None:
+    unprepared_s, _ = prepared_latency_median(dsn, None)
+    prepared_s, generic_plans = prepared_latency_median(dsn, 5)
+    if generic_plans <= 0:
+        raise AssertionError("psycopg prepared path did not produce a generic plan")
+    max_allowed = unprepared_s * 1.30
+    if prepared_s > max_allowed:
+        raise AssertionError(
+            "prepared generic path regressed: "
+            f"unprepared={unprepared_s:.4f}s prepared={prepared_s:.4f}s "
+            f"max_allowed={max_allowed:.4f}s"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dsn", default=os.environ.get("DATABASE_URL", ""))
@@ -163,7 +228,8 @@ def main() -> None:
     parser.add_argument("--min-speedup", type=float, default=2.0)
     args = parser.parse_args()
 
-    with psycopg.connect(args.dsn or f"dbname={os.environ['USER']}") as conn:
+    dsn = args.dsn or f"dbname={os.environ['USER']}"
+    with psycopg.connect(dsn) as conn:
         conn.autocommit = True
         notices: list[str] = []
         conn.add_notice_handler(lambda diag: notices.append(diag.message_primary))
@@ -259,6 +325,7 @@ def main() -> None:
             assert_vchord_plan(cur, "off", "for timed off-mode run")
             assert_vchord_plan(cur, "reject_only", "for timed reject_only run")
             assert_generic_param_metadata_quals(cur, notices)
+            assert_prepared_latency_no_cliff(dsn)
 
             off_result, off_s = run_timed(cur, "off", False, args.repeats, notices)
             if any(n.startswith(DEBUG_NOTICE_PREFIX) for n in notices):
