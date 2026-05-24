@@ -110,6 +110,7 @@ For more usage, please read:
 - [Measure Recall](https://docs.vectorchord.ai/vectorchord/usage/measure-recall.html)
 - [Prewarm](https://docs.vectorchord.ai/vectorchord/usage/prewarm.html)
 - [Prefilter](https://docs.vectorchord.ai/vectorchord/usage/prefilter.html)
+- [vchordrq Index-Resident Metadata Prefilter](docs/vchordrq-metadata-prefilter.md)
 - [Prefetch](https://docs.vectorchord.ai/vectorchord/usage/prefetch.html)
 - [Rerank in Table](https://docs.vectorchord.ai/vectorchord/usage/rerank-in-table.html)
 - [Partitioning Tuning](https://docs.vectorchord.ai/vectorchord/usage/partitioning-tuning.html)
