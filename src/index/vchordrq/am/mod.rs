@@ -36,6 +36,34 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use vchordrq::InsertChooser;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TotalRowsSource {
+    BaseRel,
+    IndexOptInfo,
+    IndexRelation,
+    SiblingIndex,
+    Unknown,
+}
+
+impl TotalRowsSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            TotalRowsSource::BaseRel => "baserel",
+            TotalRowsSource::IndexOptInfo => "index_opt_info",
+            TotalRowsSource::IndexRelation => "index_relation",
+            TotalRowsSource::SiblingIndex => "sibling_index",
+            TotalRowsSource::Unknown => "unknown",
+        }
+    }
+
+    fn is_missing_stats_fallback(self) -> bool {
+        matches!(
+            self,
+            TotalRowsSource::IndexRelation | TotalRowsSource::SiblingIndex
+        )
+    }
+}
+
 #[repr(C)]
 pub struct Reloption {
     vl_len_: i32,
@@ -306,25 +334,47 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         // table rows the index scan retrieves, not the fraction surviving all
         // filters. With LIMIT, the retrieved fraction is better represented
         // by the candidate count computed below.
-        let (total_rows, filter_selectivity) = {
+        let (mut total_rows, filtered_rows, mut filter_selectivity, mut total_rows_source) = {
             let baserel = (*index_opt_info).rel;
-            let total_rows = (*baserel).tuples;
+            let (total_rows, total_rows_source) = if (*baserel).tuples > 0.0 {
+                ((*baserel).tuples, TotalRowsSource::BaseRel)
+            } else if (*index_opt_info).tuples > 0.0 {
+                ((*index_opt_info).tuples, TotalRowsSource::IndexOptInfo)
+            } else {
+                (0.0, TotalRowsSource::Unknown)
+            };
             let param_info = (*path).path.param_info;
             let filtered_rows = if !param_info.is_null() {
                 (*param_info).ppi_rows
             } else {
                 (*baserel).rows
             };
-            let filter_selectivity = if total_rows > 0.0 {
-                (filtered_rows / total_rows).clamp(1e-9, 1.0)
-            } else {
-                1.0
-            };
-            (total_rows, filter_selectivity)
+            let filter_selectivity = planner_filter_selectivity(total_rows, filtered_rows);
+            (
+                total_rows,
+                filtered_rows,
+                filter_selectivity,
+                total_rows_source,
+            )
         };
         // index exists
         if !(*index_opt_info).hypothetical {
             let relation = Index::open((*index_opt_info).indexoid, pgrx::pg_sys::NoLock as _);
+            if total_rows <= 0.0 {
+                let index_relation_rows = (*(*relation.raw()).rd_rel).reltuples as f64;
+                if index_relation_rows > 0.0 {
+                    total_rows = index_relation_rows;
+                    total_rows_source = TotalRowsSource::IndexRelation;
+                    filter_selectivity = planner_filter_selectivity(total_rows, filtered_rows);
+                }
+            }
+            if total_rows <= 0.0
+                && let Some(sibling_rows) = planner_sibling_index_rows(index_opt_info)
+            {
+                total_rows = sibling_rows;
+                total_rows_source = TotalRowsSource::SiblingIndex;
+                filter_selectivity = planner_filter_selectivity(total_rows, filtered_rows);
+            }
             let opfamily = opfamily(relation.raw());
             if !matches!(
                 opfamily,
@@ -393,6 +443,13 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             };
             let mut heap_prefilter_count = next_count;
             let mut metadata_eval_cost = 0.0;
+            let mut estimated_metadata_rows = f64::NAN;
+            let mut metadata_sparse_for_limit = false;
+            let metadata_limit_tuples = if (*root).limit_tuples > 0.0 {
+                (*root).limit_tuples
+            } else {
+                0.0
+            };
             if gucs::vchordrq_prefilter()
                 && gucs::vchordrq_metadata_prefilter() != gucs::MetadataPrefilterMode::Off
                 && !gucs::vchordrq_metadata_prefilter_debug()
@@ -405,25 +462,77 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 if let Some(metadata_cost) =
                     metadata_qual::planner_metadata_cost(root, path, &schema, &active)
                 {
+                    let metadata_selectivity_floor = if total_rows > 0.0 && filter_selectivity < 1.0
+                    {
+                        filter_selectivity
+                    } else {
+                        0.0
+                    };
                     let metadata_selectivity = if metadata_cost.selectivity.is_finite() {
-                        metadata_cost.selectivity.clamp(filter_selectivity, 1.0)
+                        metadata_cost
+                            .selectivity
+                            .clamp(metadata_selectivity_floor, 1.0)
                     } else {
                         1.0
                     };
+                    if total_rows > 0.0 {
+                        estimated_metadata_rows = total_rows * metadata_selectivity;
+                    }
+                    metadata_sparse_for_limit = metadata_limit_tuples > 0.0
+                        && estimated_metadata_rows.is_finite()
+                        && estimated_metadata_rows < metadata_limit_tuples;
+                    let applied_metadata_selectivity = if metadata_sparse_for_limit {
+                        1.0
+                    } else {
+                        metadata_selectivity
+                    };
                     heap_prefilter_count =
-                        (next_count * metadata_selectivity).clamp(0.0, next_count);
-                    metadata_eval_cost = next_count
+                        (next_count * applied_metadata_selectivity).clamp(0.0, next_count);
+                    metadata_eval_cost = heap_prefilter_count
                         * metadata_cost.supported_qual_count as f64
                         * pgrx::pg_sys::cpu_operator_cost;
+                    if gucs::vchordrq_metadata_qual_diagnostics() {
+                        pgrx::notice!(
+                            "vchordrq_metadata_cost_diagnostics metadata_supported_qual_count={} metadata_unresolved_param_count={} metadata_fallback_qual_count={} raw_selectivity={} fallback_selectivity={} selected_selectivity={} clamped_selectivity={} applied_selectivity={} metadata_selectivity_floor={} filter_selectivity={} total_rows={} total_rows_source={} estimated_metadata_rows={} metadata_limit_tuples={} metadata_sparse_for_limit={} next_count={} heap_prefilter_count={} metadata_eval_cost={}",
+                            metadata_cost.supported_qual_count,
+                            metadata_cost.unresolved_param_count,
+                            metadata_cost.fallback_qual_count,
+                            metadata_cost.raw_selectivity,
+                            metadata_cost.fallback_selectivity,
+                            metadata_cost.selectivity,
+                            metadata_selectivity,
+                            applied_metadata_selectivity,
+                            metadata_selectivity_floor,
+                            filter_selectivity,
+                            total_rows,
+                            total_rows_source.as_str(),
+                            estimated_metadata_rows,
+                            metadata_limit_tuples,
+                            metadata_sparse_for_limit,
+                            next_count,
+                            heap_prefilter_count,
+                            metadata_eval_cost,
+                        );
+                    }
                 }
             }
             let scan_selectivity = if total_rows > 0.0 {
                 (heap_prefilter_count / total_rows).clamp(1e-9, 1.0)
+            } else if next_count > 0.0 {
+                (heap_prefilter_count / next_count).clamp(1e-9, 1.0)
             } else {
                 1.0
             };
-            *index_startup_cost = 0.001 * node_count;
-            *index_total_cost = 0.001 * node_count + heap_prefilter_count + metadata_eval_cost;
+            let startup_count = if total_rows_source.is_missing_stats_fallback()
+                && !metadata_sparse_for_limit
+                && heap_prefilter_count < next_count
+            {
+                heap_prefilter_count
+            } else {
+                node_count
+            };
+            *index_startup_cost = 0.001 * startup_count;
+            *index_total_cost = 0.001 * startup_count + heap_prefilter_count + metadata_eval_cost;
             *index_selectivity = scan_selectivity;
             *index_correlation = 0.0;
             *index_pages = page_count;
@@ -434,6 +543,46 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         *index_selectivity = filter_selectivity;
         *index_correlation = 0.0;
         *index_pages = 1.0;
+    }
+}
+
+fn planner_filter_selectivity(total_rows: f64, filtered_rows: f64) -> f64 {
+    if total_rows.is_finite()
+        && total_rows > 0.0
+        && filtered_rows.is_finite()
+        && filtered_rows > 0.0
+    {
+        (filtered_rows / total_rows).clamp(1e-9, 1.0)
+    } else {
+        1.0
+    }
+}
+
+unsafe fn planner_sibling_index_rows(index_info: *mut pgrx::pg_sys::IndexOptInfo) -> Option<f64> {
+    unsafe {
+        if index_info.is_null() || (*index_info).rel.is_null() {
+            return None;
+        }
+        let indexlist = (*(*index_info).rel).indexlist;
+        if indexlist.is_null() {
+            return None;
+        }
+        let len = (*indexlist).length.max(0) as usize;
+        let cells = (*indexlist).elements;
+        let mut rows = 0.0_f64;
+        for i in 0..len {
+            let sibling = (*cells.add(i))
+                .ptr_value
+                .cast::<pgrx::pg_sys::IndexOptInfo>();
+            if sibling.is_null() || sibling == index_info {
+                continue;
+            }
+            let sibling_rows = (*sibling).tuples;
+            if sibling_rows.is_finite() && sibling_rows > rows {
+                rows = sibling_rows;
+            }
+        }
+        if rows > 0.0 { Some(rows) } else { None }
     }
 }
 

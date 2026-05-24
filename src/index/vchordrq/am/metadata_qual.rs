@@ -12,6 +12,7 @@
 //
 // Copyright (c) 2025-2026 TensorChord Inc.
 
+use crate::index::gucs;
 use pgrx::pg_sys;
 use std::collections::BTreeSet;
 use std::ffi::CStr;
@@ -115,7 +116,18 @@ impl MetadataActiveColumns {
 #[derive(Debug, Clone, Copy)]
 pub struct PlannerMetadataCost {
     pub selectivity: f64,
+    pub raw_selectivity: f64,
+    pub fallback_selectivity: f64,
     pub supported_qual_count: usize,
+    pub unresolved_param_count: usize,
+    pub fallback_qual_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlannerQualCost {
+    selectivity: f64,
+    unresolved_param_count: usize,
+    used_fallback: bool,
 }
 
 #[derive(Default)]
@@ -189,8 +201,16 @@ pub unsafe fn planner_metadata_cost(
             return None;
         }
         let qual_list = (*index_info).indrestrictinfo;
+        let var_relid = if (*index_info).rel.is_null() {
+            0
+        } else {
+            (*(*index_info).rel).relid as i32
+        };
         let mut metadata_quals = ptr::null_mut();
         let mut supported_qual_count = 0_usize;
+        let mut fallback_selectivity = 1.0_f64;
+        let mut unresolved_param_count = 0_usize;
+        let mut fallback_qual_count = 0_usize;
         for_each_list_node(qual_list, |node| {
             if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_RestrictInfo {
                 return;
@@ -203,26 +223,47 @@ pub unsafe fn planner_metadata_cost(
                 // Reusing the planner's RestrictInfo can collapse to 1.0 here
                 // after baserel row estimates have already accounted for it.
                 metadata_quals = pg_sys::lappend(metadata_quals, clause.cast());
+                if let Some(cost) =
+                    planner_qual_cost(root, clause, index_info, schema, active, var_relid)
+                {
+                    fallback_selectivity *= cost.selectivity;
+                    unresolved_param_count += cost.unresolved_param_count;
+                    fallback_qual_count += usize::from(cost.used_fallback);
+                } else {
+                    fallback_selectivity *= planner_clause_selectivity(root, clause, var_relid);
+                }
             }
         });
         if supported_qual_count == 0 || metadata_quals.is_null() {
+            if gucs::vchordrq_metadata_qual_diagnostics() {
+                pgrx::notice!(
+                    "vchordrq_metadata_cost_diagnostics no_metadata_quals=true schema_cols={} qual_list_null={}",
+                    schema.cols(),
+                    qual_list.is_null(),
+                );
+            }
             return None;
         }
-        let var_relid = if (*index_info).rel.is_null() {
-            0
-        } else {
-            (*(*index_info).rel).relid as i32
-        };
-        let selectivity = pg_sys::clauselist_selectivity(
+        let raw_selectivity = pg_sys::clauselist_selectivity(
             root,
             metadata_quals,
             var_relid,
             pg_sys::JoinType::JOIN_INNER,
             ptr::null_mut(),
         );
+        let fallback_selectivity = clamp_selectivity(fallback_selectivity);
+        let selectivity = if unresolved_param_count > 0 {
+            clamp_selectivity(raw_selectivity).min(fallback_selectivity)
+        } else {
+            raw_selectivity
+        };
         Some(PlannerMetadataCost {
             selectivity,
+            raw_selectivity,
+            fallback_selectivity,
             supported_qual_count,
+            unresolved_param_count,
+            fallback_qual_count,
         })
     }
 }
@@ -650,6 +691,370 @@ unsafe fn planner_bitmask_contains_is_coverable(
             return false;
         };
         expected.supported && expected.same_planner_value(&mask)
+    }
+}
+
+const DEFAULT_EQ_SEL: f64 = 0.005;
+const DEFAULT_INEQ_SEL: f64 = 0.3333333333333333;
+const SELECTIVITY_FALLBACK_THRESHOLD: f64 = 0.999;
+
+unsafe fn planner_qual_cost(
+    root: *mut pg_sys::PlannerInfo,
+    node: *mut pg_sys::Node,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+    var_relid: i32,
+) -> Option<PlannerQualCost> {
+    unsafe {
+        let node = strip_relabel(node);
+        if node.is_null() {
+            return None;
+        }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_BoolExpr => {
+                let expr = node.cast::<pg_sys::BoolExpr>();
+                if (*expr).boolop != pg_sys::BoolExprType::AND_EXPR {
+                    return None;
+                }
+                let mut result = PlannerQualCost {
+                    selectivity: 1.0,
+                    unresolved_param_count: 0,
+                    used_fallback: false,
+                };
+                let args = list_nodes((*expr).args);
+                if args.is_empty() {
+                    return None;
+                }
+                for child in args {
+                    let child =
+                        planner_qual_cost(root, child, index_info, schema, active, var_relid)?;
+                    result.selectivity *= child.selectivity;
+                    result.unresolved_param_count += child.unresolved_param_count;
+                    result.used_fallback |= child.used_fallback;
+                }
+                result.selectivity = clamp_selectivity(result.selectivity);
+                Some(result)
+            }
+            pg_sys::NodeTag::T_OpExpr => {
+                planner_op_expr_cost(root, node.cast(), index_info, schema, active, var_relid)
+            }
+            pg_sys::NodeTag::T_ScalarArrayOpExpr => planner_scalar_array_expr_cost(
+                root,
+                node.cast(),
+                index_info,
+                schema,
+                active,
+                var_relid,
+            ),
+            _ => None,
+        }
+    }
+}
+
+unsafe fn planner_op_expr_cost(
+    root: *mut pg_sys::PlannerInfo,
+    expr: *mut pg_sys::OpExpr,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+    var_relid: i32,
+) -> Option<PlannerQualCost> {
+    unsafe {
+        let args = list_nodes((*expr).args);
+        if args.len() != 2 {
+            return None;
+        }
+        planner_bitmask_contains_cost(
+            root, expr, args[0], args[1], index_info, schema, active, var_relid,
+        )
+        .or_else(|| {
+            planner_binary_predicate_cost(
+                root, expr, args[0], args[1], index_info, schema, active, var_relid,
+            )
+        })
+        .or_else(|| {
+            planner_binary_predicate_cost(
+                root, expr, args[1], args[0], index_info, schema, active, var_relid,
+            )
+        })
+    }
+}
+
+unsafe fn planner_binary_predicate_cost(
+    root: *mut pg_sys::PlannerInfo,
+    expr: *mut pg_sys::OpExpr,
+    var_node: *mut pg_sys::Node,
+    value_node: *mut pg_sys::Node,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+    var_relid: i32,
+) -> Option<PlannerQualCost> {
+    unsafe {
+        let var = planner_metadata_var(var_node, index_info, schema)?;
+        let op = int8_binary_op(expr)?;
+        if var.vartype != pg_sys::INT8OID
+            || !active.contains(&var.name)
+            || !var.semantics.supports(metadata_op_for_binary_op(op))
+        {
+            return None;
+        }
+        let value = scalar_value_for_node(value_node, ptr::null_mut(), &var.name)?;
+        if !value.supported {
+            return None;
+        }
+        let raw_selectivity = planner_clause_selectivity(root, expr.cast(), var_relid);
+        let has_param = contains_external_param(value_node);
+        let (selectivity, used_fallback) =
+            if has_param && raw_selectivity >= SELECTIVITY_FALLBACK_THRESHOLD {
+                let fallback = match op {
+                    Int8BinaryOp::Eq => planner_eq_selectivity_for_var(root, var_node, var_relid),
+                    Int8BinaryOp::Ge | Int8BinaryOp::Gt | Int8BinaryOp::Le | Int8BinaryOp::Lt => {
+                        DEFAULT_INEQ_SEL
+                    }
+                };
+                (fallback, true)
+            } else {
+                (raw_selectivity, false)
+            };
+        Some(PlannerQualCost {
+            selectivity: clamp_selectivity(selectivity),
+            unresolved_param_count: usize::from(has_param),
+            used_fallback,
+        })
+    }
+}
+
+unsafe fn planner_bitmask_contains_cost(
+    root: *mut pg_sys::PlannerInfo,
+    expr: *mut pg_sys::OpExpr,
+    left: *mut pg_sys::Node,
+    right: *mut pg_sys::Node,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+    var_relid: i32,
+) -> Option<PlannerQualCost> {
+    unsafe {
+        if int8_binary_op(expr) != Some(Int8BinaryOp::Eq) {
+            return None;
+        }
+        let Some((var, mask)) = planner_int8_and(left, index_info, schema) else {
+            return None;
+        };
+        if !active.contains(&var.name) || !var.semantics.supports(MetadataColumnOp::BitmaskContains)
+        {
+            return None;
+        }
+        let expected = scalar_value_for_node(right, ptr::null_mut(), &var.name)?;
+        if !expected.supported || !expected.same_planner_value(&mask) {
+            return None;
+        }
+        let raw_selectivity = planner_clause_selectivity(root, expr.cast(), var_relid);
+        let has_param = contains_external_param(left) || contains_external_param(right);
+        let (selectivity, used_fallback) =
+            if has_param && raw_selectivity >= SELECTIVITY_FALLBACK_THRESHOLD {
+                (DEFAULT_INEQ_SEL, true)
+            } else {
+                (raw_selectivity, false)
+            };
+        Some(PlannerQualCost {
+            selectivity: clamp_selectivity(selectivity),
+            unresolved_param_count: usize::from(has_param),
+            used_fallback,
+        })
+    }
+}
+
+unsafe fn planner_scalar_array_expr_cost(
+    root: *mut pg_sys::PlannerInfo,
+    expr: *mut pg_sys::ScalarArrayOpExpr,
+    index_info: *mut pg_sys::IndexOptInfo,
+    schema: &MetadataSchema,
+    active: &MetadataActiveColumns,
+    var_relid: i32,
+) -> Option<PlannerQualCost> {
+    unsafe {
+        if !(*expr).useOr || !is_int8_equality_func((*expr).opfuncid) {
+            return None;
+        }
+        let args = list_nodes((*expr).args);
+        if args.len() != 2 {
+            return None;
+        }
+        let Some(var) = planner_metadata_var(args[0], index_info, schema) else {
+            return None;
+        };
+        if var.vartype != pg_sys::INT8OID
+            || !active.contains(&var.name)
+            || !var.semantics.supports(MetadataColumnOp::In)
+        {
+            return None;
+        }
+        let values = array_values_for_node(args[1], ptr::null_mut(), &var.name)?;
+        if !values.supported {
+            return None;
+        }
+        let raw_selectivity = planner_clause_selectivity(root, expr.cast(), var_relid);
+        let has_param = contains_external_param(args[1]);
+        let (selectivity, used_fallback) =
+            if has_param && raw_selectivity >= SELECTIVITY_FALLBACK_THRESHOLD {
+                let eq_selectivity = planner_eq_selectivity_for_var(root, args[0], var_relid);
+                let array_length = planner_array_length(root, args[1], &var.name);
+                ((eq_selectivity * array_length).min(1.0), true)
+            } else {
+                (raw_selectivity, false)
+            };
+        Some(PlannerQualCost {
+            selectivity: clamp_selectivity(selectivity),
+            unresolved_param_count: usize::from(has_param),
+            used_fallback,
+        })
+    }
+}
+
+unsafe fn planner_clause_selectivity(
+    root: *mut pg_sys::PlannerInfo,
+    clause: *mut pg_sys::Node,
+    var_relid: i32,
+) -> f64 {
+    unsafe {
+        clamp_selectivity(pg_sys::clause_selectivity_ext(
+            root,
+            clause,
+            var_relid,
+            pg_sys::JoinType::JOIN_INNER,
+            ptr::null_mut(),
+            true,
+        ))
+    }
+}
+
+unsafe fn planner_eq_selectivity_for_var(
+    root: *mut pg_sys::PlannerInfo,
+    var_node: *mut pg_sys::Node,
+    var_relid: i32,
+) -> f64 {
+    unsafe {
+        let mut vardata = pg_sys::VariableStatData::default();
+        pg_sys::examine_variable(root, var_node, var_relid, &mut vardata);
+        let mut is_default = false;
+        let ndistinct = pg_sys::get_variable_numdistinct(&mut vardata, &mut is_default);
+        release_variable_stats(&mut vardata);
+        if ndistinct.is_finite() && ndistinct > 1.0 {
+            (1.0 / ndistinct).clamp(DEFAULT_EQ_SEL, 1.0)
+        } else {
+            DEFAULT_EQ_SEL
+        }
+    }
+}
+
+unsafe fn release_variable_stats(vardata: &mut pg_sys::VariableStatData) {
+    unsafe {
+        if !vardata.statsTuple.is_null() {
+            if let Some(freefunc) = vardata.freefunc {
+                use pg_sys::ffi::pg_guard_ffi_boundary;
+
+                #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+                pg_guard_ffi_boundary(|| freefunc(vardata.statsTuple));
+            }
+            vardata.statsTuple = ptr::null_mut();
+        }
+    }
+}
+
+unsafe fn planner_array_length(
+    root: *mut pg_sys::PlannerInfo,
+    node: *mut pg_sys::Node,
+    column_name: &str,
+) -> f64 {
+    unsafe {
+        if let Some(values) = array_values_for_node(node, ptr::null_mut(), column_name)
+            && values.supported
+            && !values.values.is_empty()
+        {
+            return values.values.len() as f64;
+        }
+        let estimated = estimate_array_length_compat(root, node);
+        if estimated.is_finite() && estimated > 0.0 {
+            estimated
+        } else {
+            1.0
+        }
+    }
+}
+
+#[cfg(any(feature = "pg17", feature = "pg18"))]
+unsafe fn estimate_array_length_compat(
+    root: *mut pg_sys::PlannerInfo,
+    node: *mut pg_sys::Node,
+) -> f64 {
+    unsafe { pg_sys::estimate_array_length(root, node) }
+}
+
+#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+unsafe fn estimate_array_length_compat(
+    _root: *mut pg_sys::PlannerInfo,
+    node: *mut pg_sys::Node,
+) -> f64 {
+    unsafe { pg_sys::estimate_array_length(node) as f64 }
+}
+
+unsafe fn contains_external_param(node: *mut pg_sys::Node) -> bool {
+    unsafe {
+        let node = strip_relabel(node);
+        if node.is_null() {
+            return false;
+        }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_Param => {
+                (*node.cast::<pg_sys::Param>()).paramkind == pg_sys::ParamKind::PARAM_EXTERN
+            }
+            pg_sys::NodeTag::T_FuncExpr => {
+                let expr = node.cast::<pg_sys::FuncExpr>();
+                list_nodes((*expr).args)
+                    .into_iter()
+                    .any(|arg| contains_external_param(arg))
+            }
+            pg_sys::NodeTag::T_ArrayCoerceExpr => {
+                let expr = node.cast::<pg_sys::ArrayCoerceExpr>();
+                contains_external_param((*expr).arg.cast())
+            }
+            pg_sys::NodeTag::T_ArrayExpr => {
+                let expr = node.cast::<pg_sys::ArrayExpr>();
+                list_nodes((*expr).elements)
+                    .into_iter()
+                    .any(|arg| contains_external_param(arg))
+            }
+            pg_sys::NodeTag::T_OpExpr => {
+                let expr = node.cast::<pg_sys::OpExpr>();
+                list_nodes((*expr).args)
+                    .into_iter()
+                    .any(|arg| contains_external_param(arg))
+            }
+            pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+                let expr = node.cast::<pg_sys::ScalarArrayOpExpr>();
+                list_nodes((*expr).args)
+                    .into_iter()
+                    .any(|arg| contains_external_param(arg))
+            }
+            pg_sys::NodeTag::T_BoolExpr => {
+                let expr = node.cast::<pg_sys::BoolExpr>();
+                list_nodes((*expr).args)
+                    .into_iter()
+                    .any(|arg| contains_external_param(arg))
+            }
+            _ => false,
+        }
+    }
+}
+
+fn clamp_selectivity(selectivity: f64) -> f64 {
+    if selectivity.is_finite() {
+        selectivity.clamp(0.0, 1.0)
+    } else {
+        1.0
     }
 }
 
