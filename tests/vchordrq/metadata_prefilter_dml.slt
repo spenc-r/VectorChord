@@ -1,0 +1,514 @@
+# DML regression coverage for vchordrq resident metadata.
+#
+# The metadata prefilter stores INCLUDE-column bigint values in index tuples.
+# This test exercises rows inserted after build, metadata updates, vector+metadata
+# updates, NULL metadata, deletes, and VACUUM cleanup.  Each DML step compares
+# metadata-prefilter result sets with metadata_prefilter=off so stale resident
+# metadata cannot silently produce false negatives.
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET max_parallel_workers_per_gather = 0;
+
+statement ok
+SET vchordrq.probes = '';
+
+statement ok
+SET vchordrq.prefilter = on;
+
+statement ok
+SET vchordrq.metadata_block_prune = off;
+
+statement ok
+DROP FUNCTION IF EXISTS metadata_prefilter_dml_ids(text, text, text);
+
+statement ok
+DROP FUNCTION IF EXISTS metadata_prefilter_dml_uses_index(text);
+
+statement ok
+DROP TABLE IF EXISTS metadata_prefilter_dml_items;
+
+statement ok
+CREATE TABLE metadata_prefilter_dml_items (
+  id              int PRIMARY KEY,
+  tenant_hash     bigint,
+  state_code      bigint,
+  deletion_marker bigint,
+  flag_bits       bigint,
+  geo_token       bigint,
+  v               vector(3) NOT NULL
+);
+
+statement ok
+INSERT INTO metadata_prefilter_dml_items
+SELECT i,
+       hashtextextended('feed-' || (i % 3)::text, 0),
+       (i % 4)::bigint,
+       ((i % 13) = 0)::int::bigint,
+       CASE WHEN i % 2 = 0 THEN 3 ELSE 1 END,
+       (i % 8)::bigint,
+       ARRAY[
+         i::real / 1000.0,
+         (i % 7)::real / 10.0,
+         0.0
+       ]::real[]::vector
+FROM generate_series(1, 96) i;
+
+statement ok
+CREATE INDEX metadata_prefilter_dml_idx
+ON metadata_prefilter_dml_items
+USING vchordrq (v vector_l2_ops)
+INCLUDE (
+  tenant_hash,
+  state_code,
+  deletion_marker,
+  flag_bits,
+  geo_token
+)
+WITH (options = $$
+residual_quantization = false
+rerank_in_table = false
+[metadata]
+columns = [
+  { name = "tenant_hash", ops = ["eq", "in"], exact = false },
+  { name = "state_code", ops = ["eq", "in"], exact = true },
+  { name = "deletion_marker", ops = ["eq"], exact = true },
+  { name = "flag_bits", ops = ["eq", "bitmask_contains"], exact = true },
+  { name = "geo_token", ops = ["eq", "in", "range"], exact = false },
+]
+[build.internal]
+lists = []
+$$);
+
+statement ok
+ANALYZE metadata_prefilter_dml_items;
+
+statement ok
+CREATE OR REPLACE FUNCTION metadata_prefilter_dml_ids(
+  mode text,
+  active text,
+  where_sql text
+) RETURNS int[]
+  LANGUAGE plpgsql AS $$
+DECLARE
+  result int[];
+BEGIN
+  PERFORM set_config('enable_seqscan', 'off', true);
+  PERFORM set_config('vchordrq.prefilter', 'on', true);
+  PERFORM set_config('vchordrq.metadata_prefilter', mode, true);
+  PERFORM set_config('vchordrq.metadata_active_columns', active, true);
+  EXECUTE format(
+    'SELECT ARRAY(
+       SELECT id
+       FROM (
+         SELECT id
+         FROM metadata_prefilter_dml_items
+         WHERE %s
+         ORDER BY v <-> ''[0,0,0]''::vector
+         LIMIT 200
+       ) s
+       ORDER BY id
+     )',
+    where_sql
+  )
+  INTO result;
+  RETURN result;
+END $$;
+
+statement ok
+CREATE OR REPLACE FUNCTION metadata_prefilter_dml_uses_index(
+  where_sql text
+) RETURNS boolean
+  LANGUAGE plpgsql AS $$
+DECLARE
+  line text;
+BEGIN
+  PERFORM set_config('enable_seqscan', 'off', true);
+  PERFORM set_config('vchordrq.prefilter', 'on', true);
+  PERFORM set_config('vchordrq.metadata_prefilter', 'reject_only', true);
+  PERFORM set_config('vchordrq.metadata_active_columns', '', true);
+  FOR line IN EXECUTE format(
+    'EXPLAIN (FORMAT TEXT, COSTS OFF)
+     SELECT id
+     FROM metadata_prefilter_dml_items
+     WHERE %s
+     ORDER BY v <-> ''[0,0,0]''::vector
+     LIMIT 20',
+    where_sql
+  ) LOOP
+    IF line LIKE '%metadata_prefilter_dml_idx%' THEN
+      RETURN true;
+    END IF;
+  END LOOP;
+  RETURN false;
+END $$;
+
+query B
+SELECT metadata_prefilter_dml_uses_index(
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+);
+----
+t
+
+# Baseline: build-time frozen tuples with resident metadata match off-mode.
+query B
+SELECT metadata_prefilter_dml_ids(
+  'off',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+) = metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+);
+----
+t
+
+# Insert one matching appendable tuple and one non-matching tuple.
+statement ok
+INSERT INTO metadata_prefilter_dml_items VALUES
+  (1001, hashtextextended('feed-1', 0), 2, 0, 3, 5, '[0.001,0,0]'::vector),
+  (1002, hashtextextended('feed-1', 0), 3, 0, 3, 5, '[0.002,0,0]'::vector);
+
+query B
+SELECT metadata_prefilter_dml_ids(
+  'off',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+) = metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+);
+----
+t
+
+query B
+SELECT 1001 = ANY(metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+));
+----
+t
+
+query B
+SELECT 1002 = ANY(metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+));
+----
+f
+
+# Update a matching row so it no longer matches.  The old index entry must not
+# survive as a false positive, and reject_only must not differ from off-mode.
+statement ok
+UPDATE metadata_prefilter_dml_items
+SET state_code = 3
+WHERE id = 1001;
+
+query B
+SELECT metadata_prefilter_dml_ids(
+  'off',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+) = metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+);
+----
+t
+
+query B
+SELECT 1001 = ANY(metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+));
+----
+f
+
+# Update a formerly rejected row into the matching set.  This catches stale
+# resident metadata that would keep rejecting the new heap tuple.
+statement ok
+UPDATE metadata_prefilter_dml_items
+SET state_code = 2
+WHERE id = 1002;
+
+query B
+SELECT metadata_prefilter_dml_ids(
+  'off',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+) = metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+);
+----
+t
+
+query B
+SELECT 1002 = ANY(metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+));
+----
+t
+
+# Update vector and metadata together.  The replacement index tuple must carry
+# the replacement metadata, not the original non-matching values.
+statement ok
+INSERT INTO metadata_prefilter_dml_items VALUES
+  (1003, hashtextextended('feed-0', 0), 0, 1, 1, 0, '[0.9,0.9,0.9]'::vector);
+
+statement ok
+UPDATE metadata_prefilter_dml_items
+SET tenant_hash = hashtextextended('feed-1', 0),
+    state_code = 2,
+    deletion_marker = 0,
+    flag_bits = 3,
+    geo_token = 6,
+    v = '[0.0005,0,0]'::vector
+WHERE id = 1003;
+
+query B
+SELECT metadata_prefilter_dml_ids(
+  'off',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+) = metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+);
+----
+t
+
+query B
+SELECT 1003 = ANY(metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+));
+----
+t
+
+# NULL metadata is not resident in the index tail.  It must fall back safely,
+# and then stop matching after the row is updated to a non-NULL tenant hash.
+statement ok
+INSERT INTO metadata_prefilter_dml_items VALUES
+  (1004, NULL, 2, 0, 3, 5, '[0.003,0,0]'::vector);
+
+query B
+SELECT metadata_prefilter_dml_ids(
+  'off',
+  '',
+  $$tenant_hash IS NULL AND state_code = 2 AND deletion_marker = 0$$
+) = metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash IS NULL AND state_code = 2 AND deletion_marker = 0$$
+);
+----
+t
+
+query B
+SELECT 1004 = ANY(metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash IS NULL AND state_code = 2 AND deletion_marker = 0$$
+));
+----
+t
+
+statement ok
+UPDATE metadata_prefilter_dml_items
+SET tenant_hash = hashtextextended('feed-1', 0)
+WHERE id = 1004;
+
+query B
+SELECT metadata_prefilter_dml_ids(
+  'off',
+  '',
+  $$tenant_hash IS NULL AND state_code = 2 AND deletion_marker = 0$$
+) = metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash IS NULL AND state_code = 2 AND deletion_marker = 0$$
+);
+----
+t
+
+query B
+SELECT 1004 = ANY(metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash IS NULL AND state_code = 2 AND deletion_marker = 0$$
+));
+----
+f
+
+# Exact covered metadata may skip the AM-side heap prefilter.  Keep it equal
+# to off-mode after the update churn above.
+query B
+SELECT metadata_prefilter_dml_ids(
+  'off',
+  'state_code,deletion_marker,flag_bits',
+  $$state_code = 2 AND deletion_marker = 0 AND (flag_bits & 3) = 3$$
+) = metadata_prefilter_dml_ids(
+  'covered_skip_heap',
+  'state_code,deletion_marker,flag_bits',
+  $$state_code = 2 AND deletion_marker = 0 AND (flag_bits & 3) = 3$$
+);
+----
+t
+
+# Delete matching appendable tuples, then vacuum so bulkdelete nulls their
+# index payloads.  Both reject_only and block-prune-on reject_only must remain
+# equal to off-mode.
+statement ok
+DELETE FROM metadata_prefilter_dml_items
+WHERE id IN (1002, 1003, 1004);
+
+statement ok
+VACUUM metadata_prefilter_dml_items;
+
+query B
+SELECT metadata_prefilter_dml_ids(
+  'off',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+) = metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+);
+----
+t
+
+query B
+SELECT NOT (1002 = ANY(metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+)));
+----
+t
+
+statement ok
+SET vchordrq.metadata_block_prune = on;
+
+query B
+SELECT metadata_prefilter_dml_ids(
+  'off',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+) = metadata_prefilter_dml_ids(
+  'reject_only',
+  '',
+  $$tenant_hash = hashtextextended('feed-1', 0)
+    AND state_code = 2
+    AND deletion_marker = 0
+    AND (flag_bits & 3) = 3
+    AND geo_token = ANY(ARRAY[4,5,6]::bigint[])$$
+);
+----
+t
+
+statement ok
+SET vchordrq.metadata_block_prune = off;
+
+statement ok
+DROP FUNCTION metadata_prefilter_dml_ids(text, text, text);
+
+statement ok
+DROP FUNCTION metadata_prefilter_dml_uses_index(text);
+
+statement ok
+DROP TABLE metadata_prefilter_dml_items;
