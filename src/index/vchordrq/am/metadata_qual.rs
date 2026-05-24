@@ -1116,8 +1116,12 @@ unsafe fn fetch_param_value(
         if params.is_null() || param.paramid > (*params).numParams {
             return ParamValue::Unavailable;
         }
-        let param_data = if (*params).paramFetch.is_some() {
-            return ParamValue::Unavailable;
+        let param_data = if let Some(param_fetch) = (*params).paramFetch {
+            use pg_sys::ffi::pg_guard_ffi_boundary;
+
+            let mut workspace = pg_sys::ParamExternData::default();
+            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+            pg_guard_ffi_boundary(|| param_fetch(params, param.paramid, false, &mut workspace))
         } else {
             (*params)
                 .params
