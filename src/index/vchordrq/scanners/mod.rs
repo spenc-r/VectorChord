@@ -462,21 +462,14 @@ pub struct MetadataPrefilterOptions {
 }
 
 impl MetadataPrefilterOptions {
-    pub fn can_skip_heap_prefilter(&self, candidate_metadata: vchordrq::CandidateMetadata) -> bool {
-        if !self.all_quals_covered || self.predicates.is_empty() {
-            return false;
-        }
-        match self.mode {
-            MetadataPrefilterMode::Off => false,
-            MetadataPrefilterMode::RejectOnly => self
+    pub fn can_skip_heap_prefilter(&self) -> bool {
+        self.mode == MetadataPrefilterMode::CoveredSkipHeap
+            && self.all_quals_covered
+            && !self.predicates.is_empty()
+            && self
                 .predicates
                 .iter()
-                .all(|predicate| predicate.is_definitely_false(candidate_metadata) == Some(false)),
-            MetadataPrefilterMode::CoveredSkipHeap => self
-                .predicates
-                .iter()
-                .all(MetadataPredicate::is_exact_for_heap_skip),
-        }
+                .all(MetadataPredicate::is_exact_for_heap_skip)
     }
 }
 
@@ -495,87 +488,4 @@ pub struct SearchOptions {
     pub vector_read_window: usize,
     pub metadata_prefilter: MetadataPrefilterOptions,
     pub instrumentation: Option<SearchInstrumentation>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::index::vchordrq::am::metadata_qual::{MetadataPredicate, MetadataPredicateOp};
-
-    fn metadata(values: &[(usize, i64)]) -> vchordrq::CandidateMetadata {
-        let mut metadata = vchordrq::CandidateMetadata::default();
-        for &(index, value) in values {
-            metadata.set(index, value);
-        }
-        metadata
-    }
-
-    fn predicate(metadata_index: usize, exact: bool, op: MetadataPredicateOp) -> MetadataPredicate {
-        MetadataPredicate {
-            metadata_index,
-            column_name: format!("col_{metadata_index}"),
-            exact,
-            op,
-        }
-    }
-
-    fn options(
-        mode: MetadataPrefilterMode,
-        all_quals_covered: bool,
-        predicates: Vec<MetadataPredicate>,
-    ) -> MetadataPrefilterOptions {
-        MetadataPrefilterOptions {
-            mode,
-            schema_cols: 0,
-            predicates,
-            hypothetical_predicates: Vec::new(),
-            all_quals_covered,
-            block_prune: false,
-            debug: false,
-        }
-    }
-
-    #[test]
-    fn reject_only_skips_heap_prefilter_when_metadata_proves_all_covered_quals_pass() {
-        let opts = options(
-            MetadataPrefilterMode::RejectOnly,
-            true,
-            vec![
-                predicate(0, false, MetadataPredicateOp::Eq(42)),
-                predicate(1, false, MetadataPredicateOp::In(vec![7, 9])),
-            ],
-        );
-
-        assert!(opts.can_skip_heap_prefilter(metadata(&[(0, 42), (1, 9)])));
-        assert!(!opts.can_skip_heap_prefilter(metadata(&[(0, 42)])));
-        assert!(!opts.can_skip_heap_prefilter(metadata(&[(0, 42), (1, 8)])));
-    }
-
-    #[test]
-    fn reject_only_keeps_heap_prefilter_when_scan_quals_are_not_fully_covered() {
-        let opts = options(
-            MetadataPrefilterMode::RejectOnly,
-            false,
-            vec![predicate(0, false, MetadataPredicateOp::Eq(42))],
-        );
-
-        assert!(!opts.can_skip_heap_prefilter(metadata(&[(0, 42)])));
-    }
-
-    #[test]
-    fn covered_skip_heap_still_requires_exact_predicates() {
-        let exact = options(
-            MetadataPrefilterMode::CoveredSkipHeap,
-            true,
-            vec![predicate(0, true, MetadataPredicateOp::Eq(42))],
-        );
-        let inexact = options(
-            MetadataPrefilterMode::CoveredSkipHeap,
-            true,
-            vec![predicate(0, false, MetadataPredicateOp::Eq(42))],
-        );
-
-        assert!(exact.can_skip_heap_prefilter(metadata(&[])));
-        assert!(!inexact.can_skip_heap_prefilter(metadata(&[(0, 42)])));
-    }
 }

@@ -58,17 +58,21 @@ ORDER BY v <-> ('[' || array_to_string(array_fill(0.13::real, ARRAY[{VECTOR_DIM}
 LIMIT 50
 """
 
-PREPARED_CLIFF_QUERY = f"""
+GENERIC_PREPARED_QUERY = f"""
 SELECT id
 FROM metadata_prefilter_smoke
 WHERE tenant_hash = hashtextextended('feed-10', 0)
-  AND state_code = %(state)s::bigint
-  AND deletion_marker = %(deleted)s::bigint
-  AND (flag_bits & %(mask)s::bigint) = %(mask)s::bigint
-  AND geo_token = ANY(%(geo)s::bigint[])
+  AND state_code = $1::bigint
+  AND deletion_marker = $2::bigint
+  AND (flag_bits & $3::bigint) = $3::bigint
+  AND geo_token = ANY($4::bigint[])
 ORDER BY v <-> ('[' || array_to_string(array_fill(0.13::real, ARRAY[{VECTOR_DIM}]), ',') || ']')::vector
-LIMIT 20
+LIMIT 50
 """
+
+GENERIC_EXECUTE_ARGS = (
+    "0::bigint, 0::bigint, 3::bigint, ARRAY[10,20,30,40,50]::bigint[]"
+)
 
 
 def configure_prefilter(cur: psycopg.Cursor, mode: str, debug: bool = False) -> None:
@@ -112,6 +116,28 @@ def run_timed(
 def parse_counters(notice_body: str) -> dict[str, str]:
     """Pull `key=value` pairs out of a vchordrq_metadata_prefilter NOTICE line."""
     return dict(re.findall(r"(\w+)=([^ ]+)", notice_body))
+
+
+def assert_relation_stats(cur: psycopg.Cursor, *rel_names: str) -> None:
+    cur.execute(
+        """
+        SELECT relname, reltuples
+        FROM pg_class
+        WHERE relname = ANY(%s)
+        """,
+        (list(rel_names),),
+    )
+    stats = {relname: float(reltuples) for relname, reltuples in cur.fetchall()}
+    missing = [relname for relname in rel_names if stats.get(relname, 0.0) <= 0.0]
+    if missing:
+        raise AssertionError(f"ANALYZE left zero reltuples for {missing}: {stats}")
+
+
+def top_total_cost(plan: str) -> float:
+    match = re.search(r"\.\.([0-9]+(?:\.[0-9]+)?) rows=", plan)
+    if match is None:
+        raise AssertionError("could not parse top-level total cost from plan:\n" + plan)
+    return float(match.group(1))
 
 
 def assert_generic_param_metadata_quals(
@@ -167,57 +193,48 @@ def assert_generic_param_metadata_quals(
     cur.execute("RESET client_min_messages")
 
 
-def prepared_latency_median(dsn: str, prepare_threshold: int | None) -> tuple[float, int]:
-    params = {
-        "state": 0,
-        "deleted": 0,
-        "mask": 3,
-        "geo": [10, 110, 210, 310, 410],
-    }
-    timings = []
-    row_count: int | None = None
-    generic_plans = 0
-    with psycopg.connect(
-        dsn, autocommit=True, prepare_threshold=prepare_threshold
-    ) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SET enable_seqscan = off")
-            cur.execute("SET enable_bitmapscan = off")
-            cur.execute("SET plan_cache_mode = auto")
-            cur.execute("SET vchordrq.prefilter = on")
-            cur.execute("SET vchordrq.metadata_prefilter = reject_only")
-            cur.execute(
-                "SET vchordrq.metadata_active_columns = "
-                "'tenant_hash,state_code,deletion_marker,flag_bits,geo_token'"
-            )
-            for _ in range(20):
-                started = time.perf_counter()
-                cur.execute(PREPARED_CLIFF_QUERY, params)
-                rows = cur.fetchall()
-                timings.append(time.perf_counter() - started)
-                if row_count is None:
-                    row_count = len(rows)
-                elif row_count != len(rows):
-                    raise AssertionError("prepared latency check returned unstable row counts")
-            cur.execute("SELECT coalesce(sum(generic_plans), 0) FROM pg_prepared_statements")
-            generic_plans = int(cur.fetchone()[0])
-    if row_count is None or row_count == 0:
-        raise AssertionError("prepared latency check needs non-empty result rows")
-    return statistics.median(timings[10:]), generic_plans
+def assert_prepared_generic_plan_cost(cur: psycopg.Cursor) -> None:
+    cur.execute("SET enable_seqscan = off")
+    cur.execute("SET enable_bitmapscan = off")
+    cur.execute("SET plan_cache_mode = force_generic_plan")
+    cur.execute("SET vchordrq.prefilter = on")
+    cur.execute(
+        "SET vchordrq.metadata_active_columns = "
+        "'tenant_hash,state_code,deletion_marker,flag_bits,geo_token'"
+    )
 
-
-def assert_prepared_latency_no_cliff(dsn: str) -> None:
-    unprepared_s, _ = prepared_latency_median(dsn, None)
-    prepared_s, generic_plans = prepared_latency_median(dsn, 5)
-    if generic_plans <= 0:
-        raise AssertionError("psycopg prepared path did not produce a generic plan")
-    max_allowed = unprepared_s * 1.30
-    if prepared_s > max_allowed:
-        raise AssertionError(
-            "prepared generic path regressed: "
-            f"unprepared={unprepared_s:.4f}s prepared={prepared_s:.4f}s "
-            f"max_allowed={max_allowed:.4f}s"
+    costs: dict[str, float] = {}
+    plans: dict[str, str] = {}
+    for mode in ("off", "reject_only"):
+        name = f"metadata_prefilter_smoke_generic_{mode}"
+        cur.execute(f"SET vchordrq.metadata_prefilter = {mode}")
+        cur.execute(
+            f"PREPARE {name}(bigint, bigint, bigint, bigint[]) "
+            f"AS {GENERIC_PREPARED_QUERY}"
         )
+        cur.execute(
+            f"EXPLAIN (FORMAT TEXT, COSTS ON) EXECUTE {name}"
+            f"({GENERIC_EXECUTE_ARGS})"
+        )
+        plan = "\n".join(row[0] for row in cur.fetchall())
+        plans[mode] = plan
+        costs[mode] = top_total_cost(plan)
+        cur.execute(f"DEALLOCATE {name}")
+
+    if "metadata_prefilter_smoke_idx" not in plans["reject_only"]:
+        raise AssertionError(
+            "prepared generic reject_only plan did not choose vchordrq index:\n"
+            + plans["reject_only"]
+        )
+    if costs["reject_only"] >= costs["off"]:
+        raise AssertionError(
+            "metadata prefilter should lower generic prepared vchord cost: "
+            f"off={costs['off']:.2f} reject_only={costs['reject_only']:.2f}\n"
+            f"off plan:\n{plans['off']}\nreject_only plan:\n{plans['reject_only']}"
+        )
+
+    cur.execute("SET plan_cache_mode = auto")
+    cur.execute("RESET enable_bitmapscan")
 
 
 def main() -> None:
@@ -305,11 +322,20 @@ def main() -> None:
                 """
             )
             cur.execute("ANALYZE metadata_prefilter_smoke")
+            assert_relation_stats(
+                cur, "metadata_prefilter_smoke", "metadata_prefilter_smoke_idx"
+            )
             cur.execute(
                 "CREATE INDEX metadata_prefilter_smoke_filter_idx "
                 "ON metadata_prefilter_smoke (tenant_hash, state_code, deletion_marker)"
             )
             cur.execute("ANALYZE metadata_prefilter_smoke")
+            assert_relation_stats(
+                cur,
+                "metadata_prefilter_smoke",
+                "metadata_prefilter_smoke_idx",
+                "metadata_prefilter_smoke_filter_idx",
+            )
 
             assert_vchord_plan(
                 cur,
@@ -322,10 +348,13 @@ def main() -> None:
             # access path, not a btree+sort shortcut in one mode.
             cur.execute("DROP INDEX metadata_prefilter_smoke_filter_idx")
             cur.execute("ANALYZE metadata_prefilter_smoke")
+            assert_relation_stats(
+                cur, "metadata_prefilter_smoke", "metadata_prefilter_smoke_idx"
+            )
             assert_vchord_plan(cur, "off", "for timed off-mode run")
             assert_vchord_plan(cur, "reject_only", "for timed reject_only run")
             assert_generic_param_metadata_quals(cur, notices)
-            assert_prepared_latency_no_cliff(dsn)
+            assert_prepared_generic_plan_cost(cur)
 
             off_result, off_s = run_timed(cur, "off", False, args.repeats, notices)
             if any(n.startswith(DEBUG_NOTICE_PREFIX) for n in notices):

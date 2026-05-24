@@ -271,7 +271,7 @@ fn metadata_heap_prefilter_allows(
     instrumentation: Option<&SearchInstrumentation>,
     metadata_prefilter: &MetadataPrefilterOptions,
 ) -> bool {
-    if metadata_prefilter.can_skip_heap_prefilter(candidate_metadata) {
+    if metadata_prefilter.can_skip_heap_prefilter() {
         if let Some(instrumentation) = instrumentation {
             instrumentation.increment_heap_prefilter_after_metadata();
             instrumentation.record_residual_result(true);
